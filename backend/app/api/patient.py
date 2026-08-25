@@ -287,76 +287,57 @@ def reanalyze_report(
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found on server")
 
-    suffix = file_path.suffix.lower()
-    if suffix == ".pdf":
-        extracted_text = extract_text(str(file_path))
-    elif suffix in {".jpg", ".jpeg", ".png"}:
-        extracted_text = extract_text(str(file_path))
-        if not extracted_text and is_vision_available():
-            vision_result = analyze_image_with_type(str(file_path))
-            if vision_result:
-                extracted_text = vision_result.get("analysis", "")
-    else:
-        extracted_text = ""
+    extracted_text = extract_text(str(file_path))
+    if not extracted_text and is_vision_available():
+        vision_result = analyze_image_with_type(str(file_path))
+        if vision_result:
+            extracted_text = vision_result.get("analysis", "")
 
     if not extracted_text:
         raise HTTPException(status_code=422, detail="Could not extract text from this file. The file may be corrupted or in an unsupported format.")
 
     logger.info("[REANALYZE] Extracted %d chars from report %d", len(extracted_text), report_id)
     report.ocr_text = extracted_text
+    report.processing_status = "STRUCTURING"
     db.commit()
-    db.refresh(report)
 
-    structured_data = None
+    structured_data = extract_document_structure(extracted_text, report.report_type or "Medical Report")
     verified_data = None
     summary_text = None
-    if is_ollama_available():
-        structured_data = extract_document_structure(extracted_text, report.report_type or "Medical Report")
-        if structured_data:
-            verified_data = validate_extracted_data(structured_data, extracted_text)
-            for param in verified_data.get("parameters", []):
-                if param.get("type") == "compound":
-                    ref = {"low": None, "high": None}
-                else:
-                    ref = _parse_reference_range(param.get("reference_range"))
-                unit_mismatch = False
-                if param.get("type") == "numeric" and param.get("unit"):
-                    if not _is_unit_consistent(str(param.get("value", "")), str(param.get("unit", "")), extracted_text):
-                        unit_mismatch = True
-                param["status"] = _status_from_reference(
-                    param.get("value"),
-                    param.get("reference_range"),
-                    unit_mismatch=unit_mismatch,
-                )
-                if unit_mismatch:
-                    param["status"] = "UNKNOWN"
-                    param["unit_mismatch"] = True
 
-            summary_text = _generate_summary_from_structure(
-                doc_type=verified_data.get("document_type", "other_medical_report"),
-                title=verified_data.get("title", "Medical Report"),
-                sections=verified_data.get("sections", []),
-                findings=verified_data.get("findings", []),
-                measurements=verified_data.get("parameters", []),
-                source_text=extracted_text,
-            )
+    if structured_data:
+        verified_data = validate_extracted_data(structured_data, extracted_text)
+
+    if verified_data and (verified_data.get("parameters") or verified_data.get("findings")):
+        summary_text = _generate_summary_from_structure(
+            doc_type=verified_data.get("document_type", "laboratory_report"),
+            title=verified_data.get("title", report.report_type or "Medical Report"),
+            sections=verified_data.get("sections", []),
+            findings=verified_data.get("findings", []),
+            measurements=verified_data.get("parameters", []),
+            source_text=extracted_text,
+        )
+
     if not summary_text:
         summary_text = _build_summary_text(report.report_type or "Report", [], extracted_text, report.uploaded_at)
-    logger.info("[REANALYZE] Final summary length: %d", len(summary_text) if summary_text else 0)
+
+    report.processing_status = "COMPLETED"
+    report.processing_error = None
+    db.commit()
 
     existing_summary = db.query(AISummary).filter(AISummary.report_id == report.report_id).first()
     if existing_summary:
         existing_summary.summary = summary_text
-        existing_summary.report_type = report.report_type
-        existing_summary.structured_data = json.dumps(structured_data) if structured_data else None
+        existing_summary.report_type = (verified_data.get("document_type") if verified_data else None) or report.report_type
+        existing_summary.structured_data = json.dumps(verified_data or structured_data) if (verified_data or structured_data) else None
         existing_summary.verified_data = json.dumps(verified_data) if verified_data else None
         existing_summary.processing_version = "2.0"
     else:
         db.add(AISummary(
             report_id=report.report_id,
             summary=summary_text,
-            report_type=report.report_type,
-            structured_data=json.dumps(structured_data) if structured_data else None,
+            report_type=(verified_data.get("document_type") if verified_data else None) or report.report_type,
+            structured_data=json.dumps(verified_data or structured_data) if (verified_data or structured_data) else None,
             verified_data=json.dumps(verified_data) if verified_data else None,
             processing_version="2.0",
         ))
@@ -376,7 +357,7 @@ def reanalyze_report(
         "report_id": report.report_id,
         "ocr_text": report.ocr_text,
         "summary": summary_text,
-        "structured_data": structured_data,
+        "structured_data": verified_data or structured_data,
         "message": "Report re-analyzed successfully",
     }
 
@@ -781,114 +762,64 @@ def get_ai_summary(report_id: int, db: Session = Depends(get_db), current_user: 
     findings = []
     summary_text = summary_row.summary if summary_row else None
 
-    if summary_row and summary_row.structured_data:
+    if summary_row and (summary_row.verified_data or summary_row.structured_data):
         try:
-            structured_data = json.loads(summary_row.structured_data)
-            findings = structured_data.get("parameters", [])
+            raw_data = summary_row.verified_data or summary_row.structured_data
+            parsed = json.loads(raw_data)
+            verified_data = parsed
+            structured_data = parsed
+            findings = parsed.get("parameters", [])
         except (json.JSONDecodeError, TypeError):
             structured_data = None
+            verified_data = None
             findings = []
 
-    placeholder_ocr = report.ocr_text and (report.ocr_text.startswith("[") and report.ocr_text.endswith("]"))
-    summary_is_placeholder = summary_text and (
-        "no extractable text" in summary_text.lower()
-        or "automatic text extraction failed" in summary_text.lower()
-        or "pdf uploaded" in summary_text.lower()
-        or "image uploaded" in summary_text.lower()
-    )
+    # If no OCR text in report record, extract it now from file
+    if not report.ocr_text and report.report_file:
+        file_path = Path(__file__).resolve().parents[2] / report.report_file
+        if file_path.exists():
+            extracted = extract_text(str(file_path))
+            if extracted:
+                report.ocr_text = extracted
+                db.commit()
 
-    structured_data_is_placeholder = False
-    if structured_data and not placeholder_ocr:
-        uncertain = structured_data.get("uncertain_items", [])
-        summary_field = structured_data.get("summary", "")
-        structured_data_is_placeholder = (
-            any("extractable text" in str(u).lower() or "extraction failed" in str(u).lower() or "uploaded" in str(u).lower() for u in uncertain)
-            or "extractable text" in summary_field.lower()
-            or "extraction failed" in summary_field.lower()
-            or "uploaded" in summary_field.lower()
-        )
-
-    if summary_is_placeholder or structured_data_is_placeholder:
-        if summary_row:
-            summary_row.summary = ""
-            summary_row.structured_data = None
-            db.commit()
-        structured_data = None
-        findings = []
-        summary_text = None
-        needs_regeneration = True
-    else:
-        needs_regeneration = False
-
-    if not structured_data and report.ocr_text and is_ollama_available() and not placeholder_ocr:
+    # If missing summary or structured data, extract and summarize now
+    needs_processing = not summary_text or not findings
+    if needs_processing and report.ocr_text:
         structured_data = extract_document_structure(report.ocr_text, report.report_type or "Medical Report")
         if structured_data:
             verified_data = validate_extracted_data(structured_data, report.ocr_text)
-            for param in verified_data.get("parameters", []):
-                if param.get("type") == "compound":
-                    ref = {"low": None, "high": None}
-                else:
-                    ref = _parse_reference_range(param.get("reference_range"))
-                unit_mismatch = False
-                if param.get("type") == "numeric" and param.get("unit"):
-                    if not _is_unit_consistent(str(param.get("value", "")), str(param.get("unit", "")), report.ocr_text):
-                        unit_mismatch = True
-                param["status"] = _status_from_reference(
-                    param.get("value"),
-                    param.get("reference_range"),
-                    unit_mismatch=unit_mismatch,
-                )
-                if unit_mismatch:
-                    param["status"] = "UNKNOWN"
-                    param["unit_mismatch"] = True
-
             findings = verified_data.get("parameters", [])
-            summary_from_llm = None
-            if is_ollama_available():
-                summary_from_llm = _generate_summary_from_structure(
-                    doc_type=verified_data.get("document_type", "other_medical_report"),
-                    title=verified_data.get("title", "Medical Report"),
-                    sections=verified_data.get("sections", []),
-                    findings=verified_data.get("findings", []),
-                    measurements=verified_data.get("parameters", []),
-                    source_text=report.ocr_text,
-                )
-            new_summary = summary_from_llm or ""
+            summary_text = _generate_summary_from_structure(
+                doc_type=verified_data.get("document_type", "laboratory_report"),
+                title=verified_data.get("title", report.report_type or "Medical Report"),
+                sections=verified_data.get("sections", []),
+                findings=verified_data.get("findings", []),
+                measurements=verified_data.get("parameters", []),
+                source_text=report.ocr_text,
+            )
+
             if summary_row:
-                summary_row.summary = new_summary or summary_row.summary
+                summary_row.summary = summary_text
                 summary_row.report_type = verified_data.get("document_type", report.report_type)
-                summary_row.structured_data = json.dumps(structured_data)
+                summary_row.structured_data = json.dumps(verified_data)
                 summary_row.verified_data = json.dumps(verified_data)
                 summary_row.processing_version = "2.0"
             else:
-                db.add(AISummary(
+                summary_row = AISummary(
                     report_id=report.report_id,
-                    summary=new_summary or "",
+                    summary=summary_text or "",
                     report_type=verified_data.get("document_type", report.report_type),
-                    structured_data=json.dumps(structured_data),
+                    structured_data=json.dumps(verified_data),
                     verified_data=json.dumps(verified_data),
                     processing_version="2.0",
-                ))
+                )
+                db.add(summary_row)
+            report.processing_status = "COMPLETED"
             db.commit()
-            db.refresh(summary_row if summary_row else db.query(AISummary).filter(AISummary.report_id == report.report_id).first())
-            summary_text = (summary_row.summary if summary_row else new_summary) or ""
 
-    if needs_regeneration and not summary_text and placeholder_ocr:
-        if is_ollama_available():
-            placeholder_context = f"Report type: {report.report_type}\nDate: {report.uploaded_at}\nNote: A {report.report_type} report was uploaded. The actual report content could not be automatically extracted. Please consult your doctor for a detailed interpretation of your {report.report_type} results."
-            llm_summary = generate_summary(placeholder_context, report.report_type or "Medical Report")
-            if llm_summary and not _is_refusal(llm_summary):
-                summary_text = llm_summary
-    if not summary_text and needs_regeneration:
-        summary_text = _build_summary_text(report.report_type or "Report", findings, "", report.uploaded_at)
-    if summary_text and needs_regeneration:
-        if summary_row:
-            summary_row.summary = summary_text
-            db.commit()
-        else:
-            summary_row = AISummary(report_id=report.report_id, summary=summary_text, report_type=report.report_type)
-            db.add(summary_row)
-            db.commit()
+    if not summary_text:
+        summary_text = _build_summary_text(report.report_type or "Report", findings, report.ocr_text or "", report.uploaded_at)
 
     trends = _build_trends(report, findings, db)
 
@@ -898,24 +829,35 @@ def get_ai_summary(report_id: int, db: Session = Depends(get_db), current_user: 
             "parameter": param.get("name", ""),
             "value": param.get("value", ""),
             "unit": param.get("unit", ""),
-            "reference": param.get("reference_range", ""),
+            "reference": param.get("reference_raw") or param.get("reference_range", ""),
             "reference_low": param.get("reference_low"),
             "reference_high": param.get("reference_high"),
-            "status": param.get("status", "Unknown"),
-            "confidence": param.get("confidence", "LOW"),
+            "status": param.get("status", "NORMAL"),
+            "confidence": param.get("confidence", "HIGH"),
             "type": param.get("type", "numeric"),
             "source_text": param.get("source_text", ""),
         })
 
     imaging_findings = []
-    if verified_data:
-        raw_findings = verified_data.get("findings", [])
+    active_data = verified_data or structured_data
+    if active_data:
+        raw_findings = active_data.get("findings", [])
         if isinstance(raw_findings, list):
-            imaging_findings = [str(f) for f in raw_findings if f]
-    elif structured_data:
-        raw_findings = structured_data.get("findings", [])
-        if isinstance(raw_findings, list):
-            imaging_findings = [str(f) for f in raw_findings if f]
+            imaging_findings = [str(f) for f in raw_findings if f and str(f).strip()]
+        elif isinstance(raw_findings, str) and raw_findings.strip():
+            imaging_findings = [raw_findings.strip()]
+
+    return {
+        "report_id": report.report_id,
+        "report_type": report.report_type,
+        "ocr_text": report.ocr_text,
+        "summary": summary_text,
+        "findings": api_findings,
+        "imaging_findings": imaging_findings,
+        "trends": trends,
+        "structured_data": active_data,
+        "generated_at": summary_row.generated_at if summary_row else None,
+    }
 
     return {
         "report_id": report.report_id,
@@ -1055,7 +997,9 @@ def get_disease_predictions(db: Session = Depends(get_db), current_user: User = 
 
 @router.get("/drug-list", response_model=list[str])
 def get_drug_list():
-    return sorted({drug for drug in COMMON_DRUGS})
+    interaction_drugs = sorted({d for entry in INTERACTION_DB for d in entry.get("drugs", [])})
+    all_drugs = sorted(set(interaction_drugs) | set(COMMON_DRUGS))
+    return all_drugs
 
 
 @router.post("/drug-interaction", response_model=list[DrugInteractionResponse], status_code=status.HTTP_201_CREATED)

@@ -1,29 +1,39 @@
 from typing import Optional
 import base64
+import logging
 from pathlib import Path
 
 import ollama
 from ollama import Client
 
+logger = logging.getLogger(__name__)
+
 OLLAMA_HOST = "http://localhost:11434"
-VISION_MODEL = "llava:13b"
 _client = Client(host=OLLAMA_HOST)
 
 
-def is_vision_available() -> bool:
+def get_vision_model() -> Optional[str]:
+    """Auto-detect available vision model, preferring faster 4B models."""
     try:
         models_resp = _client.list()
-        # Handle both dict and ListResponse object formats
         if hasattr(models_resp, 'models'):
             model_names = [m.model for m in models_resp.models]
         else:
             model_names = [m.get("name", "") for m in models_resp.get("models", [])]
-        return any(VISION_MODEL in name for name in model_names)
-    except Exception:
-        return False
+        for pref in ["gemma3:4b", "gemma3", "llava:13b", "llava"]:
+            for name in model_names:
+                if pref in name:
+                    return name
+    except Exception as e:
+        logger.warning("[Vision] Failed to list models: %s", e)
+    return None
 
 
-def _identify_image_type(image_base64: str) -> str:
+def is_vision_available() -> bool:
+    return get_vision_model() is not None
+
+
+def _identify_image_type(image_base64: str, model_name: str) -> str:
     """Identify the medical image type and body part."""
     identification_prompt = (
         "You are a radiology assistant. Identify this medical image.\n"
@@ -33,13 +43,14 @@ def _identify_image_type(image_base64: str) -> str:
     )
     try:
         response = _client.generate(
-            model=VISION_MODEL,
+            model=model_name,
             prompt=identification_prompt,
             images=[image_base64],
         )
         text = response.get("response", "").strip()
         return text if text else ""
-    except Exception:
+    except Exception as e:
+        logger.warning("[Vision] Image type identification failed: %s", e)
         return ""
 
 
@@ -57,14 +68,15 @@ def _normalize_detected_type(detected: str) -> str:
 
 def analyze_image_with_type(image_path: str, prompt: Optional[str] = None) -> Optional[dict]:
     """Analyze image and return both detected type and analysis."""
-    if not is_vision_available():
+    model_name = get_vision_model()
+    if not model_name:
         return None
 
     try:
         image_bytes = Path(image_path).read_bytes()
         image_base64 = base64.b64encode(image_bytes).decode("utf-8")
         
-        detected_type = _identify_image_type(image_base64)
+        detected_type = _identify_image_type(image_base64, model_name)
         normalized_type = _normalize_detected_type(detected_type)
         
         if not prompt:
@@ -80,7 +92,7 @@ def analyze_image_with_type(image_path: str, prompt: Optional[str] = None) -> Op
             )
         
         response = _client.generate(
-            model=VISION_MODEL,
+            model=model_name,
             prompt=prompt,
             images=[image_base64],
         )
@@ -94,7 +106,7 @@ def analyze_image_with_type(image_path: str, prompt: Optional[str] = None) -> Op
             "analysis": analysis_text if analysis_text else None
         }
     except Exception as e:
-        print(f"[Vision] Image analysis failed: {e}")
+        logger.error("[Vision] Image analysis failed: %s", e)
         return None
 
 

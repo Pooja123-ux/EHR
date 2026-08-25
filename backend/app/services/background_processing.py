@@ -12,10 +12,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
-from app.models.models import LabReport, AISummary, Base
+from app.models.models import LabReport, AISummary
 from app.services.text_extraction import extract_text
-from app.services.llm_service import extract_document_structure, _generate_summary_from_structure, is_ollama_available, _status_from_reference, _parse_reference_range
-from app.services.report_validation import validate_extracted_data, _is_unit_consistent
+from app.services.llm_service import extract_document_structure, _generate_summary_from_structure
+from app.services.report_validation import validate_extracted_data
 from app.services.rag_service import rag_service, is_rag_available
 from app.services.report_parsing import build_summary_text as _build_summary_text
 
@@ -54,7 +54,7 @@ def process_report(report_id: int, db) -> None:
         if not extracted_text:
             report.ocr_text = None
             report.processing_status = "FAILED_OCR"
-            report.processing_error = "Could not extract text from this file. The file may be corrupted, password-protected, or contain only images that could not be processed."
+            report.processing_error = "Could not extract text from this file. The file may be corrupted or contain an unsupported format."
             db.commit()
             return
 
@@ -62,45 +62,26 @@ def process_report(report_id: int, db) -> None:
         report.processing_status = "STRUCTURING"
         db.commit()
 
-        structured_data = None
+        structured_data = extract_document_structure(extracted_text, report.report_type or "Medical Report")
         verified_data = None
         summary_text = None
 
-        if is_ollama_available():
-            structured_data = extract_document_structure(extracted_text, report.report_type or "Medical Report")
-            if structured_data:
-                report.processing_status = "VALIDATING"
-                db.commit()
+        if structured_data:
+            report.processing_status = "VALIDATING"
+            db.commit()
 
-                verified_data = validate_extracted_data(structured_data, extracted_text)
-                for param in verified_data.get("parameters", []):
-                    if param.get("type") == "compound":
-                        ref = {"low": None, "high": None}
-                    else:
-                        ref = _parse_reference_range(param.get("reference_range"))
-                    unit_mismatch = False
-                    if param.get("type") == "numeric" and param.get("unit"):
-                        if not _is_unit_consistent(str(param.get("value", "")), str(param.get("unit", "")), extracted_text):
-                            unit_mismatch = True
-                    param["status"] = _status_from_reference(
-                        param.get("value"),
-                        param.get("reference_range"),
-                        unit_mismatch=unit_mismatch,
-                    )
-                    if unit_mismatch:
-                        param["status"] = "UNKNOWN"
-                        param["unit_mismatch"] = True
+            verified_data = validate_extracted_data(structured_data, extracted_text)
+            logger.info("[BG] Validated %d parameters, %d findings for report %d",
+                        len(verified_data.get("parameters", [])),
+                        len(verified_data.get("findings", [])),
+                        report_id)
 
-                logger.info("[BG] Validated %d parameters, %d findings",
-                           len(verified_data.get("parameters", [])),
-                           len(verified_data.get("findings", [])))
-
-        if verified_data:
+        if verified_data and (verified_data.get("parameters") or verified_data.get("findings")):
             report.processing_status = "SUMMARIZING"
             db.commit()
             summary_text = _generate_summary_from_structure(
-                doc_type=verified_data.get("document_type", "other_medical_report"),
-                title=verified_data.get("title", "Medical Report"),
+                doc_type=verified_data.get("document_type", "laboratory_report"),
+                title=verified_data.get("title", report.report_type or "Medical Report"),
                 sections=verified_data.get("sections", []),
                 findings=verified_data.get("findings", []),
                 measurements=verified_data.get("parameters", []),
@@ -111,22 +92,23 @@ def process_report(report_id: int, db) -> None:
             summary_text = _build_summary_text(report.report_type or "Report", [], extracted_text, report.uploaded_at)
 
         report.processing_status = "COMPLETED"
+        report.processing_error = None
         db.commit()
 
         if summary_text:
             existing = db.query(AISummary).filter(AISummary.report_id == report.report_id).first()
             if existing:
                 existing.summary = summary_text
-                existing.report_type = report.report_type
-                existing.structured_data = json.dumps(structured_data) if structured_data else None
+                existing.report_type = (verified_data.get("document_type") if verified_data else None) or report.report_type
+                existing.structured_data = json.dumps(verified_data or structured_data) if (verified_data or structured_data) else None
                 existing.verified_data = json.dumps(verified_data) if verified_data else None
                 existing.processing_version = "2.0"
             else:
                 db.add(AISummary(
                     report_id=report.report_id,
                     summary=summary_text,
-                    report_type=report.report_type,
-                    structured_data=json.dumps(structured_data) if structured_data else None,
+                    report_type=(verified_data.get("document_type") if verified_data else None) or report.report_type,
+                    structured_data=json.dumps(verified_data or structured_data) if (verified_data or structured_data) else None,
                     verified_data=json.dumps(verified_data) if verified_data else None,
                     processing_version="2.0",
                 ))
