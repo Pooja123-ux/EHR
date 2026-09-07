@@ -1,14 +1,22 @@
+from datetime import date, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, Depends
+from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 import logging
 
 from app.api import auth, patient, doctor, lab, admin
+from app.api.deps import get_current_user
 from app.core.database import Base, engine, get_db
+from app.models.models import Appointment, Doctor, Notification, Patient, User
 import app.models
 
 logging.basicConfig(
@@ -16,7 +24,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(title="EHR AI System", version="1.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,7 +46,95 @@ app.include_router(admin.router)
 
 uploads_dir = Path(__file__).resolve().parent / "uploads"
 uploads_dir.mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=str(uploads_dir)), name="uploads")
+
+
+# ── Authenticated file download ───────────────────────────────────────────────
+
+_bearer = HTTPBearer(auto_error=False)
+
+
+@app.get("/uploads/{file_path:path}")
+def serve_upload(
+    file_path: str,
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer),
+    db: Session = Depends(get_db),
+):
+    """Proxy for uploaded files — requires a valid JWT."""
+    if not credentials:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    # Validate token (reuse existing dep logic)
+    from app.core.security import decode_access_token
+    payload = decode_access_token(credentials.credentials)
+    if not payload or not payload.get("user_id"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+
+    target = (uploads_dir / file_path).resolve()
+    # Prevent path traversal
+    if not str(target).startswith(str(uploads_dir.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(str(target))
+
+
+# ── Appointment reminder scheduler ───────────────────────────────────────────
+
+def _send_appointment_reminders() -> None:
+    """Runs every hour; sends a notification for appointments happening tomorrow."""
+    from app.core.database import SessionLocal
+    db = SessionLocal()
+    try:
+        tomorrow = date.today() + timedelta(days=1)
+        upcoming = (
+            db.query(Appointment, Patient, Doctor, User)
+            .join(Patient, Patient.patient_id == Appointment.patient_id)
+            .join(Doctor, Doctor.doctor_id == Appointment.doctor_id)
+            .join(User, User.user_id == Doctor.user_id)
+            .filter(
+                Appointment.appointment_date == tomorrow,
+                Appointment.status.notin_(["Cancelled", "Completed"]),
+            )
+            .all()
+        )
+        for appt, pat, doc, doc_user in upcoming:
+            already = (
+                db.query(Notification)
+                .filter(
+                    Notification.user_id == pat.user_id,
+                    Notification.title == "Appointment Reminder",
+                    Notification.message.like(f"%appointment_id={appt.appointment_id}%"),
+                )
+                .first()
+            )
+            if not already:
+                db.add(Notification(
+                    user_id=pat.user_id,
+                    title="Appointment Reminder",
+                    message=(
+                        f"Reminder: You have an appointment with Dr. {doc_user.full_name} "
+                        f"tomorrow ({tomorrow}) at {appt.appointment_time}. "
+                        f"[appointment_id={appt.appointment_id}]"
+                    ),
+                ))
+        db.commit()
+    except Exception as e:
+        logging.getLogger(__name__).error("[REMINDER] Failed: %s", e)
+    finally:
+        db.close()
+
+
+_scheduler = BackgroundScheduler()
+_scheduler.add_job(_send_appointment_reminders, "interval", hours=1, id="appt_reminders")
+
+
+@app.on_event("startup")
+def start_scheduler() -> None:
+    _scheduler.start()
+
+
+@app.on_event("shutdown")
+def stop_scheduler() -> None:
+    _scheduler.shutdown(wait=False)
 
 
 @app.on_event("startup")

@@ -96,6 +96,7 @@ class Laboratory(Base):
     lab_name = Column(String(100))
     registration_number = Column(String(50), unique=True)
     address = Column(Text)
+    hospital_id = Column(Integer, ForeignKey("hospitals.hospital_id"), nullable=True)
 
     user = relationship("User", back_populates="lab")
     lab_reports = relationship("LabReport", back_populates="lab")

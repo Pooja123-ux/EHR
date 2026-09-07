@@ -54,7 +54,7 @@ def process_report(report_id: int, db) -> None:
         if not extracted_text:
             report.ocr_text = None
             report.processing_status = "FAILED_OCR"
-            report.processing_error = "Could not extract text from this file. The file may be corrupted or contain an unsupported format."
+            report.processing_error = "Could not extract text or visual findings from this file."
             db.commit()
             return
 
@@ -62,31 +62,49 @@ def process_report(report_id: int, db) -> None:
         report.processing_status = "STRUCTURING"
         db.commit()
 
-        structured_data = extract_document_structure(extracted_text, report.report_type or "Medical Report")
+        structured_data = None
         verified_data = None
         summary_text = None
 
-        if structured_data:
-            report.processing_status = "VALIDATING"
-            db.commit()
+        # Check if it's an imaging report with direct visual findings
+        if extracted_text.startswith("Medical Imaging Study:"):
+            findings_text = extracted_text.replace("Medical Imaging Study:", "").strip()
+            lines = [l.strip() for l in findings_text.split("\n") if l.strip() and not l.startswith("Findings (AI visual")]
+            summary_text = findings_text
+            verified_data = {
+                "document_type": "imaging_report",
+                "title": report.report_type or "Medical Imaging Report",
+                "findings": lines or [findings_text],
+                "parameters": [],
+                "uncertain_items": [],
+                "summary": summary_text,
+            }
+            structured_data = verified_data
+        else:
+            structured_data = extract_document_structure(extracted_text, report.report_type or "Medical Report")
+            if structured_data:
+                report.processing_status = "VALIDATING"
+                db.commit()
 
-            verified_data = validate_extracted_data(structured_data, extracted_text)
-            logger.info("[BG] Validated %d parameters, %d findings for report %d",
-                        len(verified_data.get("parameters", [])),
-                        len(verified_data.get("findings", [])),
-                        report_id)
+                verified_data = validate_extracted_data(structured_data, extracted_text)
+                logger.info("[BG] Validated %d parameters, %d findings for report %d",
+                            len(verified_data.get("parameters", [])),
+                            len(verified_data.get("findings", [])),
+                            report_id)
 
-        if verified_data and (verified_data.get("parameters") or verified_data.get("findings")):
-            report.processing_status = "SUMMARIZING"
-            db.commit()
-            summary_text = _generate_summary_from_structure(
-                doc_type=verified_data.get("document_type", "laboratory_report"),
-                title=verified_data.get("title", report.report_type or "Medical Report"),
-                sections=verified_data.get("sections", []),
-                findings=verified_data.get("findings", []),
-                measurements=verified_data.get("parameters", []),
-                source_text=extracted_text,
-            )
+            if verified_data and (verified_data.get("parameters") or verified_data.get("findings")):
+                report.processing_status = "SUMMARIZING"
+                db.commit()
+                summary_text = _generate_summary_from_structure(
+                    doc_type=verified_data.get("document_type", "laboratory_report"),
+                    title=verified_data.get("title", report.report_type or "Medical Report"),
+                    sections=verified_data.get("sections", []),
+                    findings=verified_data.get("findings", []),
+                    measurements=verified_data.get("parameters", []),
+                    source_text=extracted_text,
+                    impression=verified_data.get("impression", ""),
+                    recommendations=verified_data.get("recommendations", []),
+                )
 
         if not summary_text:
             summary_text = _build_summary_text(report.report_type or "Report", [], extracted_text, report.uploaded_at)
@@ -97,31 +115,25 @@ def process_report(report_id: int, db) -> None:
 
         if summary_text:
             existing = db.query(AISummary).filter(AISummary.report_id == report.report_id).first()
+            active_struct = json.dumps(verified_data or structured_data) if (verified_data or structured_data) else None
+            active_verif = json.dumps(verified_data) if verified_data else None
+            doc_type = (verified_data.get("document_type") if verified_data else None) or report.report_type
+
             if existing:
                 existing.summary = summary_text
-                existing.report_type = (verified_data.get("document_type") if verified_data else None) or report.report_type
-                existing.structured_data = json.dumps(verified_data or structured_data) if (verified_data or structured_data) else None
-                existing.verified_data = json.dumps(verified_data) if verified_data else None
+                existing.report_type = doc_type
+                existing.structured_data = active_struct
+                existing.verified_data = active_verif
                 existing.processing_version = "2.0"
             else:
                 db.add(AISummary(
                     report_id=report.report_id,
                     summary=summary_text,
-                    report_type=(verified_data.get("document_type") if verified_data else None) or report.report_type,
-                    structured_data=json.dumps(verified_data or structured_data) if (verified_data or structured_data) else None,
-                    verified_data=json.dumps(verified_data) if verified_data else None,
+                    report_type=doc_type,
+                    structured_data=active_struct,
+                    verified_data=active_verif,
                     processing_version="2.0",
                 ))
-
-        if extracted_text and is_rag_available():
-            try:
-                rag_service.add_document(
-                    text=extracted_text,
-                    source=f"patient_report_{report.report_id}",
-                    metadata={"type": "patient_report", "patient_id": report.patient_id, "report_id": report.report_id, "report_type": report.report_type},
-                )
-            except Exception as e:
-                logger.error("[RAG] Failed to ingest report %d: %s", report_id, e)
 
         db.commit()
         logger.info("[BG] Processing completed for report %d", report_id)

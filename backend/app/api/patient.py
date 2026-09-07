@@ -6,12 +6,14 @@ import re
 from typing import Optional
 
 import ollama
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile, status
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
 from ..models.models import (
-    AISummary, AIChat, Appointment, ConsentSharing, DiseasePrediction,
-    Doctor, DrugInteraction, LabReport, Laboratory, MedicalRecord, MedicalTimeline,
+    AISummary, AIChat, Appointment, AuditLog, ConsentSharing, DiseasePrediction,
+    Doctor, DoctorAvailability, DrugInteraction, LabReport, Laboratory, MedicalRecord, MedicalTimeline,
     Notification, Patient, Prescription, User,
 )
 from ..schemas.schemas import (
@@ -31,12 +33,15 @@ from ..services.report_parsing import classify_report_type, build_summary_text a
 from ..services.text_extraction import extract_text
 from ..services.background_processing import _process_report_background
 from ..services.report_validation import validate_extracted_data, _is_unit_consistent
+from ..ml.predictor import predict_disease
+from ..ml.drug_interaction_predictor import predict_drug_interaction
 from .deps import get_current_user
 from ..core.database import get_db
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/patient", tags=["patient"])
+limiter = Limiter(key_func=get_remote_address)
 
 RECOMMENDATIONS = {
     "LOW":    "Stay hydrated and rest well. Monitor symptoms for 48 hours. Take OTC medication if needed.",
@@ -179,6 +184,7 @@ def get_records(db: Session = Depends(get_db), current_user: User = Depends(get_
 
 @router.post("/records", status_code=status.HTTP_201_CREATED)
 async def upload_patient_record(
+    background_tasks: BackgroundTasks,
     report_type: str = Form(...),
     report_file: UploadFile | None = File(None),
     ocr_text: Optional[str] = Form(None),
@@ -215,7 +221,7 @@ async def upload_patient_record(
         report_file=report_file_path,
         ocr_text=ocr_text if (ocr_text and not ocr_text.startswith("[")) else None,
         status="Requested",
-        processing_status="EXTRACTING",
+        processing_status="EXTRACTING" if report_file_path else "COMPLETED",
     )
     db.add(report)
     db.flush()
@@ -231,15 +237,8 @@ async def upload_patient_record(
     db.refresh(report)
 
     if report_file_path:
-        try:
-            from app.services.background_processing import process_report
-            process_report(report.report_id, db)
-            db.refresh(report)
-        except Exception as e:
-            logger.error("[UPLOAD] Background processing failed: %s", e)
-            report.processing_status = "FAILED"
-            report.processing_error = str(e)
-            db.commit()
+        from app.services.background_processing import _process_report_background
+        background_tasks.add_task(_process_report_background, report.report_id)
 
     return {
         "report_id": report.report_id,
@@ -287,11 +286,10 @@ def reanalyze_report(
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found on server")
 
+    # extract_text() already runs the full OCR -> vision-transcription ->
+    # full-visual-analysis pipeline internally for any file type (PDF or image,
+    # text document or bare radiology image), so no extra fallback is needed here.
     extracted_text = extract_text(str(file_path))
-    if not extracted_text and is_vision_available():
-        vision_result = analyze_image_with_type(str(file_path))
-        if vision_result:
-            extracted_text = vision_result.get("analysis", "")
 
     if not extracted_text:
         raise HTTPException(status_code=422, detail="Could not extract text from this file. The file may be corrupted or in an unsupported format.")
@@ -308,7 +306,7 @@ def reanalyze_report(
     if structured_data:
         verified_data = validate_extracted_data(structured_data, extracted_text)
 
-    if verified_data and (verified_data.get("parameters") or verified_data.get("findings")):
+    if verified_data and (verified_data.get("parameters") or verified_data.get("findings") or verified_data.get("impression")):
         summary_text = _generate_summary_from_structure(
             doc_type=verified_data.get("document_type", "laboratory_report"),
             title=verified_data.get("title", report.report_type or "Medical Report"),
@@ -316,10 +314,15 @@ def reanalyze_report(
             findings=verified_data.get("findings", []),
             measurements=verified_data.get("parameters", []),
             source_text=extracted_text,
+            impression=verified_data.get("impression", ""),
+            recommendations=verified_data.get("recommendations", []),
         )
 
     if not summary_text:
         summary_text = _build_summary_text(report.report_type or "Report", [], extracted_text, report.uploaded_at)
+
+    if verified_data and verified_data.get("title") and (not report.report_type or report.report_type.strip().lower() in {"other", "medical report", ""}):
+        report.report_type = verified_data["title"]
 
     report.processing_status = "COMPLETED"
     report.processing_error = None
@@ -389,10 +392,10 @@ def analyze_report_image(
 
     vision_notes = vision_result.get("analysis")
     detected_type = vision_result.get("detected_type")
-    
+
     if detected_type and detected_type not in ("Not a standard medical image", ""):
         report.report_type = detected_type.split("\n")[0].strip()
-    
+
     if vision_notes:
         if report.ocr_text:
             report.ocr_text = f"{report.ocr_text}\n\n[Vision Analysis]\n{vision_notes}"
@@ -402,6 +405,50 @@ def analyze_report_image(
     db.commit()
     db.refresh(report)
 
+    # Re-run the same generic structuring -> validation -> summarization pipeline
+    # used for every other report type, now that we have fresh vision-derived
+    # text, so the AI summary actually reflects this manual re-analysis.
+    summary_text = None
+    verified_data = None
+    if report.ocr_text:
+        structured_data = extract_document_structure(report.ocr_text, report.report_type or "Medical Report")
+        if structured_data:
+            verified_data = validate_extracted_data(structured_data, report.ocr_text)
+            if verified_data.get("parameters") or verified_data.get("findings") or verified_data.get("impression"):
+                summary_text = _generate_summary_from_structure(
+                    doc_type=verified_data.get("document_type", "imaging_report"),
+                    title=verified_data.get("title", report.report_type or "Medical Report"),
+                    sections=verified_data.get("sections", []),
+                    findings=verified_data.get("findings", []),
+                    measurements=verified_data.get("parameters", []),
+                    source_text=report.ocr_text,
+                    impression=verified_data.get("impression", ""),
+                    recommendations=verified_data.get("recommendations", []),
+                )
+        if not summary_text:
+            summary_text = _build_summary_text(report.report_type or "Report", [], report.ocr_text, report.uploaded_at)
+
+        existing_summary = db.query(AISummary).filter(AISummary.report_id == report.report_id).first()
+        if existing_summary:
+            existing_summary.summary = summary_text
+            existing_summary.report_type = (verified_data.get("document_type") if verified_data else None) or report.report_type
+            existing_summary.structured_data = json.dumps(verified_data) if verified_data else existing_summary.structured_data
+            existing_summary.verified_data = json.dumps(verified_data) if verified_data else existing_summary.verified_data
+            existing_summary.processing_version = "2.0"
+        else:
+            db.add(AISummary(
+                report_id=report.report_id,
+                summary=summary_text,
+                report_type=(verified_data.get("document_type") if verified_data else None) or report.report_type,
+                structured_data=json.dumps(verified_data) if verified_data else None,
+                verified_data=json.dumps(verified_data) if verified_data else None,
+                processing_version="2.0",
+            ))
+        report.processing_status = "COMPLETED"
+        report.processing_error = None
+        db.commit()
+        db.refresh(report)
+
     if report.ocr_text and is_rag_available():
         try:
             rag_service.add_document(
@@ -410,9 +457,16 @@ def analyze_report_image(
                 metadata={"type": "patient_report", "patient_id": patient.patient_id, "report_id": report.report_id, "report_type": report.report_type},
             )
         except Exception as e:
-            print(f"[RAG] Failed to re-ingest report after vision analysis: {e}")
+            logger.error("[RAG] Failed to re-ingest report after vision analysis: %s", e)
 
-    return {"report_id": report.report_id, "report_type": report.report_type, "ocr_text": report.ocr_text, "vision_analysis": vision_result}
+    return {
+        "report_id": report.report_id,
+        "report_type": report.report_type,
+        "ocr_text": report.ocr_text,
+        "vision_analysis": vision_result,
+        "summary": summary_text,
+        "structured_data": verified_data,
+    }
 
 
 @router.post("/rag/ingest-reports")
@@ -774,44 +828,61 @@ def get_ai_summary(report_id: int, db: Session = Depends(get_db), current_user: 
             verified_data = None
             findings = []
 
-    # If no OCR text in report record, extract it now from file
-    if not report.ocr_text and report.report_file:
-        file_path = Path(__file__).resolve().parents[2] / report.report_file
-        if file_path.exists():
-            extracted = extract_text(str(file_path))
-            if extracted:
-                report.ocr_text = extracted
-                db.commit()
+    # If summary is missing, generate on demand
+    if not summary_text or len(summary_text.strip()) < 10:
+        if not report.ocr_text and report.report_file:
+            file_path = Path(__file__).resolve().parents[2] / report.report_file
+            if file_path.exists():
+                extracted = extract_text(str(file_path))
+                if extracted:
+                    report.ocr_text = extracted
+                    db.commit()
 
-    # If missing summary or structured data, extract and summarize now
-    needs_processing = not summary_text or not findings
-    if needs_processing and report.ocr_text:
-        structured_data = extract_document_structure(report.ocr_text, report.report_type or "Medical Report")
-        if structured_data:
-            verified_data = validate_extracted_data(structured_data, report.ocr_text)
-            findings = verified_data.get("parameters", [])
-            summary_text = _generate_summary_from_structure(
-                doc_type=verified_data.get("document_type", "laboratory_report"),
-                title=verified_data.get("title", report.report_type or "Medical Report"),
-                sections=verified_data.get("sections", []),
-                findings=verified_data.get("findings", []),
-                measurements=verified_data.get("parameters", []),
-                source_text=report.ocr_text,
-            )
+        if report.ocr_text:
+            if report.ocr_text.startswith("Medical Imaging Study:"):
+                findings_text = report.ocr_text.replace("Medical Imaging Study:", "").strip()
+                lines = [l.strip() for l in findings_text.split("\n") if l.strip() and not l.startswith("Findings (AI visual")]
+                summary_text = findings_text
+                verified_data = {
+                    "document_type": "imaging_report",
+                    "title": report.report_type or "Medical Imaging Report",
+                    "findings": lines or [findings_text],
+                    "parameters": [],
+                    "uncertain_items": [],
+                }
+            else:
+                structured_data = extract_document_structure(report.ocr_text, report.report_type or "Medical Report")
+                if structured_data:
+                    verified_data = validate_extracted_data(structured_data, report.ocr_text)
+                    findings = verified_data.get("parameters", [])
+                    summary_text = _generate_summary_from_structure(
+                        doc_type=verified_data.get("document_type", "laboratory_report"),
+                        title=verified_data.get("title", report.report_type or "Medical Report"),
+                        sections=verified_data.get("sections", []),
+                        findings=verified_data.get("findings", []),
+                        measurements=verified_data.get("parameters", []),
+                        source_text=report.ocr_text,
+                        impression=verified_data.get("impression", ""),
+                        recommendations=verified_data.get("recommendations", []),
+                    )
 
+            if not summary_text:
+                summary_text = _build_summary_text(report.report_type or "Report", findings, report.ocr_text or "", report.uploaded_at)
+
+            active_save = verified_data or structured_data
             if summary_row:
                 summary_row.summary = summary_text
-                summary_row.report_type = verified_data.get("document_type", report.report_type)
-                summary_row.structured_data = json.dumps(verified_data)
-                summary_row.verified_data = json.dumps(verified_data)
+                summary_row.report_type = (verified_data.get("document_type") if verified_data else None) or report.report_type
+                summary_row.structured_data = json.dumps(active_save) if active_save else None
+                summary_row.verified_data = json.dumps(verified_data) if verified_data else None
                 summary_row.processing_version = "2.0"
             else:
                 summary_row = AISummary(
                     report_id=report.report_id,
                     summary=summary_text or "",
-                    report_type=verified_data.get("document_type", report.report_type),
-                    structured_data=json.dumps(verified_data),
-                    verified_data=json.dumps(verified_data),
+                    report_type=(verified_data.get("document_type") if verified_data else None) or report.report_type,
+                    structured_data=json.dumps(active_save) if active_save else None,
+                    verified_data=json.dumps(verified_data) if verified_data else None,
                     processing_version="2.0",
                 )
                 db.add(summary_row)
@@ -859,21 +930,11 @@ def get_ai_summary(report_id: int, db: Session = Depends(get_db), current_user: 
         "generated_at": summary_row.generated_at if summary_row else None,
     }
 
-    return {
-        "report_id": report.report_id,
-        "report_type": report.report_type,
-        "ocr_text": report.ocr_text,
-        "summary": summary_text,
-        "findings": api_findings,
-        "imaging_findings": imaging_findings,
-        "trends": trends,
-        "structured_data": verified_data or structured_data,
-        "generated_at": summary_row.generated_at if summary_row else None,
-    }
-
 
 @router.post("/ai-summary/chat", response_model=AIChatResponse)
+@limiter.limit("30/minute")
 def ai_summary_chat(
+    request: Request,
     data: AIChatRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -938,12 +999,19 @@ def create_disease_prediction(
 ):
     patient = get_patient_for_user(db, current_user)
     symptoms = data.symptoms
-    key = next((k for k in DISEASE_DB if k != "default" and any(s in k for s in symptoms)), None)
-    diseases = DISEASE_DB[key or "default"]
+    symptoms_str = ", ".join(symptoms)
+
+    # Use ML model; fall back to static lookup if model unavailable
+    try:
+        diseases = predict_disease(symptoms, top_n=3)
+    except Exception as e:
+        logger.warning("[ML] Disease model unavailable, using static DB: %s", e)
+        key = next((k for k in DISEASE_DB if k != "default" and any(s in k for s in symptoms)), None)
+        diseases = DISEASE_DB[key or "default"]
+
     max_prob = diseases[0]["prob"]
     risk = "HIGH" if max_prob >= 70 else "MEDIUM" if max_prob >= 40 else "LOW"
     recommendation = RECOMMENDATIONS[risk]
-    symptoms_str = ", ".join(symptoms)
 
     saved = []
     for d in diseases:
@@ -1021,13 +1089,21 @@ def check_drug_interaction(
             if pair in checked:
                 continue
             checked.add(pair)
-            match = next(
-                (e for e in INTERACTION_DB if all(d in filled[i].lower() or d in filled[j].lower() for d in e["drugs"])),
-                None,
-            )
-            description = match["desc"] if match else "No known significant interaction between these medicines."
-            suggested_alternative = match.get("alt") if match else None
-            level = match["level"] if match else "Safe"
+            # Use ML model first; fall back to static INTERACTION_DB
+            try:
+                ml_result = predict_drug_interaction(filled[i], filled[j])
+                level = ml_result["interaction_level"]
+                description = ml_result["description"]
+                suggested_alternative = ml_result["suggested_alternative"]
+            except Exception as e:
+                logger.warning("[ML] Drug model unavailable, using static DB: %s", e)
+                match = next(
+                    (e for e in INTERACTION_DB if all(d in filled[i].lower() or d in filled[j].lower() for d in e["drugs"])),
+                    None,
+                )
+                description = match["desc"] if match else "No known significant interaction between these medicines."
+                suggested_alternative = match.get("alt") if match else None
+                level = match["level"] if match else "Safe"
 
             if is_rag_available():
                 try:
@@ -1125,6 +1201,11 @@ def create_consent_sharing(
         user_id=data.shared_with_user_id,
         title="Medical Records Shared",
         message=f"{current_user.full_name} shared {len(data.record_ids)} record(s) with you. Expires {expiry}.",
+    ))
+    db.add(AuditLog(
+        user_id=current_user.user_id,
+        action=f"Consent sharing created: {len(data.record_ids)} record(s) shared with user_id={data.shared_with_user_id}, expires {expiry}",
+        module="patient",
     ))
     db.commit()
 
@@ -1269,12 +1350,14 @@ def get_doctors_by_department(
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    rows = (
-        db.query(Doctor, User)
-        .join(User, User.user_id == Doctor.user_id)
-        .filter(Doctor.specialization.ilike(f"%{department}%"))
-        .all()
-    )
+    from sqlalchemy import or_
+    dept_lower = department.lower()
+    all_rows = db.query(Doctor, User).join(User, User.user_id == Doctor.user_id).all()
+    rows = [
+        (d, u) for d, u in all_rows
+        if (d.specialization or "").lower() in dept_lower
+        or dept_lower in (d.specialization or "").lower()
+    ]
     return [
         {
             "doctor_id": d.doctor_id,
@@ -1301,6 +1384,22 @@ def get_available_slots(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
+    # day_of_week: 0=Monday ... 6=Sunday (matches Python's weekday())
+    day_of_week = slot_date.weekday()
+    availability = db.query(DoctorAvailability).filter(
+        DoctorAvailability.doctor_id == doctor_id,
+        DoctorAvailability.day_of_week == day_of_week,
+        DoctorAvailability.is_available.is_(True),
+    ).first()
+
+    # Fall back to 09:00-17:00 if no availability record exists
+    if availability:
+        start_h, start_m = availability.start_time.hour, availability.start_time.minute
+        end_h, end_m = availability.end_time.hour, availability.end_time.minute
+    else:
+        start_h, start_m = 9, 0
+        end_h, end_m = 17, 0
+
     booked = db.query(Appointment.appointment_time).filter(
         Appointment.doctor_id == doctor_id,
         Appointment.appointment_date == slot_date,
@@ -1309,8 +1408,16 @@ def get_available_slots(
     booked_times = {str(b[0])[:5] for b in booked}
 
     slots = []
-    for hour in range(9, 17):
-        for minute in (0, 30):
-            t = f"{hour:02d}:{minute:02d}"
-            slots.append({"time": t, "available": t not in booked_times})
+    current_h, current_m = start_h, start_m
+    while (current_h, current_m) < (end_h, end_m):
+        t = f"{current_h:02d}:{current_m:02d}"
+        slots.append({"time": t, "available": t not in booked_times})
+        current_m += 30
+        if current_m >= 60:
+            current_m -= 60
+            current_h += 1
+
+    if not slots and not availability:
+        # Doctor explicitly has no availability on this day
+        return [{"time": None, "available": False, "message": "Doctor is not available on this day"}]
     return slots

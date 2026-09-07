@@ -103,6 +103,19 @@ def get_pending_tests(db: Session = Depends(get_db), current_user: User = Depend
         doc_user = None
         if d:
             doc_user = db.query(User).filter(User.user_id == d.user_id).first()
+
+        # Previous tests for this patient (last 5, excluding current)
+        prev_tests = (
+            db.query(LabReport)
+            .filter(
+                LabReport.patient_id == p.patient_id,
+                LabReport.report_id != r.report_id,
+            )
+            .order_by(LabReport.uploaded_at.desc())
+            .limit(5)
+            .all()
+        )
+
         result.append({
             "report_id": r.report_id,
             "patient_id": p.patient_id,
@@ -115,6 +128,15 @@ def get_pending_tests(db: Session = Depends(get_db), current_user: User = Depend
             "doctor_specialization": d.specialization if d else None,
             "requested_at": r.uploaded_at.isoformat() if r.uploaded_at else None,
             "assigned_to_me": r.lab_id == lab.lab_id,
+            "previous_tests": [
+                {
+                    "report_id": pt.report_id,
+                    "report_type": pt.report_type,
+                    "status": pt.status,
+                    "uploaded_at": pt.uploaded_at.isoformat() if pt.uploaded_at else None,
+                }
+                for pt in prev_tests
+            ],
         })
     return result
 

@@ -27,6 +27,7 @@ migrations = [
     "ALTER TABLE lab_reports ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'Requested'",
     "ALTER TABLE lab_reports ADD COLUMN IF NOT EXISTS doctor_notes TEXT",
     "ALTER TABLE doctors ADD COLUMN IF NOT EXISTS hospital_id INTEGER",
+    "ALTER TABLE laboratories ADD COLUMN IF NOT EXISTS hospital_id INTEGER REFERENCES hospitals(hospital_id)",
     # consent_sharing: drop FK on record_id so lab report IDs can be stored
     "ALTER TABLE consent_sharing DROP CONSTRAINT IF EXISTS consent_sharing_record_id_fkey",
     "ALTER TABLE consent_sharing ALTER COLUMN record_id DROP NOT NULL",

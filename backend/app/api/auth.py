@@ -1,20 +1,24 @@
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
 from ..core.database import get_db
 from ..core.security import create_access_token, get_password_hash, verify_password
-from ..models.models import Doctor, Laboratory, Patient, User
+from ..models.models import AuditLog, Doctor, Laboratory, Patient, User
 from ..schemas.schemas import Token, UserCreate, UserLogin, UserResponse
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+limiter = Limiter(key_func=get_remote_address)
 
 password_regex = re.compile(r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{6,}$')
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def register(user_in: UserCreate, db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+def register(request: Request, user_in: UserCreate, db: Session = Depends(get_db)):
     if not password_regex.match(user_in.password):
         raise HTTPException(
             status_code=400,
@@ -76,16 +80,21 @@ def register(user_in: UserCreate, db: Session = Depends(get_db)):
                 lab_name=user_in.lab_name,
                 registration_number=user_in.registration_number,
                 address=user_in.address,
+                hospital_id=user_in.hospital_id,
             )
         )
 
     db.commit()
     db.refresh(user)
+
+    db.add(AuditLog(user_id=user.user_id, action=f"User registered: {user.email} ({role})", module="auth"))
+    db.commit()
     return user
 
 
 @router.post("/login", response_model=Token)
-def login(credentials: UserLogin, db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+def login(request: Request, credentials: UserLogin, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == credentials.email).first()
     if not user or not verify_password(credentials.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -100,4 +109,6 @@ def login(credentials: UserLogin, db: Session = Depends(get_db)):
             "role": user.role,
         }
     )
+    db.add(AuditLog(user_id=user.user_id, action=f"User logged in: {user.email}", module="auth"))
+    db.commit()
     return Token(access_token=token, role=user.role, user_id=user.user_id)

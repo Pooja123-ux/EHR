@@ -417,14 +417,49 @@ def validate_extracted_data(candidate: Dict[str, Any], source_text: str) -> Dict
                 "content": section_content,
             })
 
-    # Add standalone findings
+    # Add standalone findings with cleaning
     raw_findings = candidate.get("findings", [])
-    if isinstance(raw_findings, list):
-        for f in raw_findings:
-            if f and str(f).strip() and str(f).strip() not in all_findings:
-                all_findings.append(str(f).strip())
-    elif isinstance(raw_findings, str) and raw_findings.strip():
-        all_findings.append(raw_findings.strip())
+    if isinstance(raw_findings, str):
+        raw_findings = [raw_findings]
+    elif not isinstance(raw_findings, list):
+        raw_findings = []
+
+    _FOOTNOTE_MARKERS = [
+        "can signal", "can lead to", "can also be seen", "indicabion ol",
+        "please contact the lab", "typing enror", "typing error", "machine error",
+        "for a tree evsluation", "free evaluation", "correlate clinically",
+    ]
+    _STRAY_WORDS = {"absent", "present", "clear", "positive", "negative", "pale yellow", "normal", "unknown", "empty string", "none"}
+
+    for f in raw_findings:
+        f_str = ""
+        if isinstance(f, dict):
+            name = f.get("name") or f.get("parameter") or f.get("finding") or ""
+            val = f.get("value") or ""
+            if name and val and str(val).lower() != "absent":
+                f_str = f"{name}: {val}"
+            elif name and str(val).lower() == "absent":
+                f_str = f"No {name.lower()} detected"
+            elif name:
+                f_str = name
+            elif val:
+                f_str = str(val)
+        elif isinstance(f, str):
+            f_str = f.strip()
+
+        if not f_str or len(f_str) < 3:
+            continue
+        
+        # Skip isolated stray words
+        if f_str.lower() in _STRAY_WORDS or len(f_str.split()) < 2 and f_str.lower() in _STRAY_WORDS:
+            continue
+
+        # Skip generic lab footnotes and OCR disclaimers
+        if any(marker in f_str.lower() for marker in _FOOTNOTE_MARKERS):
+            continue
+
+        if f_str not in all_findings:
+            all_findings.append(f_str)
 
     all_parameters = _deduplicate(all_parameters)
 
@@ -438,12 +473,19 @@ def validate_extracted_data(candidate: Dict[str, Any], source_text: str) -> Dict
     else:
         overall_confidence = "LOW"
 
+    # Clean impression
+    raw_impression = str(candidate.get("impression") or "").strip()
+    if raw_impression.lower() in {"empty string", "none", "null", "please correlate clinically.", "please correlate clinically"}:
+        raw_impression = ""
+    elif any(marker in raw_impression.lower() for marker in ["typing enror", "typing error", "machine error", "free evaluation"]):
+        raw_impression = ""
+
     # Normalize uncertain_items to a list of strings
     raw_uncertain = candidate.get("uncertain_items", [])
     uncertain_items: List[str] = []
     if isinstance(raw_uncertain, list):
         for u in raw_uncertain:
-            if u and isinstance(u, str) and len(u.strip()) > 2:
+            if u and isinstance(u, str) and len(u.strip()) > 2 and u.strip().lower() not in _STRAY_WORDS:
                 uncertain_items.append(u.strip())
     elif isinstance(raw_uncertain, str) and len(raw_uncertain.strip()) > 2:
         uncertain_items.append(raw_uncertain.strip())
@@ -467,7 +509,7 @@ def validate_extracted_data(candidate: Dict[str, Any], source_text: str) -> Dict
         "sections": validated_sections,
         "parameters": all_parameters,
         "findings": all_findings,
-        "impression": str(candidate.get("impression") or "").strip(),
+        "impression": raw_impression,
         "recommendations": recommendations,
         "uncertain_items": uncertain_items,
         "confidence": overall_confidence,

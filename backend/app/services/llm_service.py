@@ -108,10 +108,37 @@ def _chunk_text(text: str, chunk_size: int = 3500, overlap: int = 300) -> List[s
     return chunks
 
 
+_IMAGING_STUDY_MARKER = "Medical Imaging Study:"
+
+
+def _fast_path_imaging_classification(ocr_text: str) -> Optional[Dict[str, Any]]:
+    """
+    text_extraction.py tags pure radiology/clinical images (no printed text, e.g.
+    an X-ray/MRI/CT photo) with a 'Medical Imaging Study: <Modality - Body Part>'
+    header before handing the vision model's description into this pipeline. When
+    present, trust it directly instead of re-classifying via another LLM call —
+    it's already a direct read of the image, for any modality/body part, not a
+    fixed list of report types.
+    """
+    if not ocr_text or _IMAGING_STUDY_MARKER not in ocr_text[:200]:
+        return None
+    first_line = ocr_text.strip().splitlines()[0]
+    header = first_line.split(_IMAGING_STUDY_MARKER, 1)[-1].strip()
+    title = header if header and header.lower() != "medical image" else "Medical Imaging Study"
+    return {"document_type": "imaging_report", "title": title, "subtype": header or None}
+
+
 def classify_document(ocr_text: str, fallback_type: str = "Medical Report") -> Dict[str, Any]:
     """Dynamically classify the document type and descriptive title from its content."""
-    default_res = {"document_type": "laboratory_report", "title": fallback_type, "subtype": None}
-    if not is_ollama_available() or not ocr_text:
+    default_res = {"document_type": "other_medical_report", "title": fallback_type, "subtype": None}
+    if not ocr_text:
+        return default_res
+
+    fast_path = _fast_path_imaging_classification(ocr_text)
+    if fast_path:
+        return fast_path
+
+    if not is_ollama_available():
         return default_res
 
     source_text = ocr_text.strip()[:3500]
@@ -242,7 +269,13 @@ def _build_extraction_prompt(chunk: str, doc_type: str, title: str, subtype: Opt
         "1. DO NOT include column headers (like 'Parameter', 'Test Name', 'Value', 'Unit', 'Reference', 'Status', 'Clinical Pathology', 'Method') as items.\n"
         "2. Extract ALL test parameters present in the text verbatim.\n"
         "3. For qualitative tests (Color, Appearance, Ketones, Glucose, Nitrite, Bile), use type 'qualitative' with verbatim value.\n"
-        "4. DO NOT invent test results that do not appear in the text.\n\n"
+        "4. DO NOT invent test results that do not appear in the text.\n"
+        "5. If the text is a narrative description of an imaging study (X-ray, MRI, CT, "
+        "ultrasound, endoscopy, dermatology photo, etc.) rather than a table of numeric "
+        "values, there may be NO numeric parameters at all — that is expected and fine. "
+        "In that case, leave 'sections'/'items' empty or minimal, and instead put each "
+        "distinct observation as its own string in 'findings' (type 'imaging_finding' if "
+        "you do add it as an item), and put the overall conclusion in 'impression'.\n\n"
         f"Document text:\n{chunk}\n\nJSON:"
     )
 
@@ -263,6 +296,7 @@ def extract_document_structure(ocr_text: str, report_type: str = "Medical Report
     all_findings = []
     all_recommendations = []
     all_uncertain = []
+    all_impressions = []
 
     if is_ollama_available():
         chunks = _chunk_text(source_text, chunk_size=3500, overlap=300)
@@ -292,6 +326,9 @@ def extract_document_structure(ocr_text: str, report_type: str = "Medical Report
                     all_uncertain.extend(data["uncertain_items"])
                 elif isinstance(data["uncertain_items"], str) and data["uncertain_items"].strip():
                     all_uncertain.append(data["uncertain_items"].strip())
+            impression = data.get("impression")
+            if impression and isinstance(impression, str) and impression.strip():
+                all_impressions.append(impression.strip())
 
     # Supplementary deterministic extraction to ensure 100% parameter recall
     regex_items = _extract_parameters_regex(source_text)
@@ -319,7 +356,7 @@ def extract_document_structure(ocr_text: str, report_type: str = "Medical Report
         "subtype": subtype,
         "sections": combined_sections,
         "findings": all_findings,
-        "impression": "",
+        "impression": " ".join(all_impressions).strip(),
         "recommendations": all_recommendations,
         "uncertain_items": all_uncertain,
     }
@@ -332,8 +369,16 @@ def _generate_summary_from_structure(
     findings: List[str],
     measurements: List[Dict[str, Any]],
     source_text: str,
+    impression: str = "",
+    recommendations: Optional[List[str]] = None,
 ) -> str:
-    """Generate clear, patient-friendly summary from verified structured parameters."""
+    """
+    Generate a clear, patient-friendly summary purely from whatever was verified
+    for THIS report — no assumptions about report type. Works identically whether
+    `measurements` holds numeric lab values, `findings`/`impression` hold narrative
+    imaging observations, or some mix of both.
+    """
+    recommendations = recommendations or []
     abnormal = [m for m in measurements if m.get("status") in {"HIGH", "LOW"}]
     normal = [m for m in measurements if m.get("status") == "NORMAL"]
     unknown = [m for m in measurements if m.get("status") not in {"HIGH", "LOW", "NORMAL"}]
@@ -347,24 +392,32 @@ def _generate_summary_from_structure(
         meas_lines.append(f"- {m.get('name')}: {m.get('value')} {m.get('unit', '')}{ref_text} — Status: {status}")
 
     findings_text = "\n".join(f"- {f}" for f in findings[:10]) if findings else "None"
+    impression_text = impression.strip() if impression else ""
+    recs_text = "\n".join(f"- {r}" for r in recommendations[:5]) if recommendations else ""
 
-    if is_ollama_available() and (meas_lines or findings):
+    if is_ollama_available() and (meas_lines or findings or impression_text):
         prompt = (
-            "You are a helpful and compassionate medical communicator explaining a patient's lab/medical report in simple, reassuring, and clear terms.\n\n"
+            "You are a helpful and compassionate medical communicator explaining a patient's medical report "
+            "(blood test, urine analysis, X-ray, MRI, CT scan, ultrasound, etc.) in simple, reassuring, and clear terms.\n\n"
             f"Report Title: {title}\n"
             f"Report Type: {doc_type}\n\n"
-            "Extracted & Verified Results:\n" + "\n".join(meas_lines) + "\n\n"
+            "Extracted & Verified Results:\n" + ("\n".join(meas_lines) if meas_lines else "None") + "\n\n"
             f"Key Clinical Findings:\n{findings_text}\n\n"
-            "INSTRUCTIONS:\n"
-            "1. Write a 3 to 4 sentence clear explanation for the patient.\n"
-            "2. State clearly whether all parameters are in normal ranges, or mention any abnormal (high/low) parameters and what they indicate in simple non-alarmist language.\n"
-            "3. Mention key normal or reassuring findings.\n"
-            "4. End with: Please consult your doctor for personalised medical advice.\n\n"
+            f"Overall Impression (if any):\n{impression_text or 'None stated'}\n\n"
+            "CRITICAL RULES:\n"
+            "1. STRICT TRUTH TO TABLE: If a parameter in the Extracted & Verified Results table is marked 'Status: NORMAL' or 'Absent' (such as Protein, Glucose, Leukocytes, Blood, etc.), you MUST state that it is normal / negative / absent. NEVER say it is elevated or abnormal.\n"
+            "2. DO NOT use the word 'unfortunately' when describing normal findings, clear scans, or the absence of disease.\n"
+            "3. If there are abnormal (HIGH/LOW) parameters, clearly point them out in simple, non-alarmist words.\n"
+            "4. For imaging scans (X-ray, MRI, CT, Ultrasound), explain the visual findings in clear plain English.\n"
+            "5. Keep the response to 3 to 5 clear sentences and end with: Please consult your doctor for personalized medical advice.\n\n"
             "Patient Summary:"
         )
         text = _safe_generate(prompt)
         if text and not _is_refusal(text) and len(text.strip()) > 30:
-            return text.strip()
+            # Post-cleanup of inadvertent "unfortunately" on normal scans
+            cleaned_text = re.sub(r"\bUnfortunately,\s*the scan (didn't|did not) show any abnormalities\b", "The scan showed no abnormalities", text, flags=re.IGNORECASE)
+            cleaned_text = re.sub(r"\bUnfortunately,\s*the scan is normal\b", "The scan is normal", cleaned_text, flags=re.IGNORECASE)
+            return cleaned_text.strip()
 
     # Deterministic high-quality fallback summary
     summary_lines = [f"AI Analysis — {title}\n"]
@@ -380,12 +433,21 @@ def _generate_summary_from_structure(
                 summary_lines.append(f"  • {m.get('name')}: {m.get('value')} {m.get('unit', '')}{ref_str} — {arrow}")
         if normal:
             summary_lines.append(f"\n{len(normal)} parameter(s) tested normal (including {', '.join(m.get('name', '') for m in normal[:5])}).")
+        if findings:
+            summary_lines.append("\nAdditional findings:")
+            for f in findings:
+                summary_lines.append(f"  • {f}")
     elif findings:
         summary_lines.append("Key findings identified from the report:")
         for f in findings:
             summary_lines.append(f"  • {f}")
+    elif impression_text:
+        summary_lines.append(f"Impression: {impression_text}")
     else:
         summary_lines.append("This report has been reviewed. Specific values were processed and stored.")
+
+    if recs_text:
+        summary_lines.append(f"\nRecommendations noted in the report:\n{recs_text}")
 
     summary_lines.append("\nPlease consult your doctor for personalised medical advice.")
     return "\n".join(summary_lines)
@@ -408,6 +470,8 @@ def generate_summary(ocr_text: str, report_type: str = "Medical Report") -> Opti
         findings=verified.get("findings", []),
         measurements=verified.get("parameters", []),
         source_text=ocr_text,
+        impression=verified.get("impression", ""),
+        recommendations=verified.get("recommendations", []),
     )
 
 

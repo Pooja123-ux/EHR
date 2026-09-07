@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from ..core.database import get_db
 from ..models.models import (
-    AISummary, Appointment, Doctor, LabReport, MedicalRecord,
+    AISummary, AuditLog, Appointment, Doctor, LabReport, MedicalRecord,
     MedicalTimeline, Notification, Patient, Prescription, User,
 )
 from ..ml.drug_interaction_predictor import predict_drug_interactions
@@ -274,6 +274,13 @@ def get_patient_ehr(
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
     user = db.query(User).filter(User.user_id == patient.user_id).first()
+
+    db.add(AuditLog(
+        user_id=current_user.user_id,
+        action=f"Doctor accessed EHR for patient_id={patient_id}",
+        module="doctor",
+    ))
+    db.commit()
 
     # Previous consultations (medical records)
     consultations = (
@@ -909,6 +916,42 @@ def mark_all_notifications_read(
     ).update({"is_read": True})
     db.commit()
     return {"message": "All notifications marked as read"}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  AI Clinical Assistant
+# ══════════════════════════════════════════════════════════════════════════
+
+class DoctorAIChatRequest(BaseModel):
+    question: str
+
+
+@router.post("/ai-chat")
+def doctor_ai_chat(
+    data: DoctorAIChatRequest,
+    current_user: User = Depends(get_current_user),
+):
+    from ..services.llm_service import is_ollama_available, _safe_generate, _is_refusal
+
+    question = data.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+
+    if is_ollama_available():
+        prompt = (
+            "You are an expert clinical AI assistant helping a licensed medical doctor. "
+            "Provide concise, evidence-based clinical information. "
+            "Include: symptoms, diagnosis criteria, treatment guidelines, drug dosages, "
+            "differential diagnoses, or referral criteria as relevant. "
+            "Always remind the doctor to apply clinical judgment. "
+            "Keep the response under 200 words.\n\n"
+            f"Doctor's question: {question}\n\nClinical Answer:"
+        )
+        reply = _safe_generate(prompt)
+        if reply and not _is_refusal(reply):
+            return {"response": reply, "source": "llm"}
+
+    return {"response": None, "source": "fallback"}
 
 
 # ══════════════════════════════════════════════════════════════════════════
