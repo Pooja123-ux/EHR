@@ -3,7 +3,7 @@
 .env.*
 !.env.example
 
-# Python cache
+# Python
 __pycache__/
 *.py[cod]
 
@@ -15,7 +15,7 @@ env/
 # Node
 node_modules/
 
-# Build files
+# Build
 build/
 dist/
 
@@ -26,12 +26,15 @@ dist/
 .vscode/
 .idea/
 
-# OS files
-.DS_Store
-Thumbs.db
-
-# ChromaDB local data
+# ChromaDB
 backend/chroma_db/
 
-# Uploaded/generated patient files
+# Patient uploads
 backend/uploads/
+
+# Cache
+backend/app/services/cache/
+
+# OS
+.DS_Store
+Thumbs.db
