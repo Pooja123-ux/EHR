@@ -1,14 +1,37 @@
-.env
-*.env
-
-# Python
-__pycache__/
-*.py[cod]
-
-# Node
-node_modules/
-
 # Environment files
 .env
 .env.*
 !.env.example
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Node
+node_modules/
+
+# Build files
+build/
+dist/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# ChromaDB local data
+backend/chroma_db/
+
+# Uploaded/generated patient files
+backend/uploads/
