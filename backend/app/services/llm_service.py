@@ -507,6 +507,16 @@ def _is_refusal(text: str) -> bool:
         "i cannot help",
         "i will not",
         "i won't",
+        "i can't provide medical advice",
+        "i cannot provide medical advice",
+        "i recommend consulting",
+        "i recommend seeing",
+        "consult a qualified healthcare professional",
+        "consult a licensed medical professional",
+        "i'm not a doctor",
+        "i am not a doctor",
+        "not qualified to provide",
+        "not authorized to provide",
     ]
     return any(marker in lower for marker in refusal_markers)
 

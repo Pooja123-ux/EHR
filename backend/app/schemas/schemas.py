@@ -275,37 +275,6 @@ class TimelineEventResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class DiseasePredictionCreate(BaseModel):
-    symptoms: list[str]
-
-
-class DiseasePredictionResponse(BaseModel):
-    prediction_id: int
-    predicted_disease: Optional[str] = None
-    probability: Optional[Decimal] = None
-    risk_level: Optional[str] = None
-    recommendation: Optional[str] = None
-    prediction_date: Optional[datetime] = None
-    symptoms: Optional[str] = None
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class DrugInteractionCreate(BaseModel):
-    medicines: list[str]
-
-
-class DrugInteractionResponse(BaseModel):
-    interaction_id: int
-    medicine1: Optional[str] = None
-    medicine2: Optional[str] = None
-    interaction_level: Optional[str] = None
-    description: Optional[str] = None
-    suggested_alternative: Optional[str] = None
-
-    model_config = ConfigDict(from_attributes=True)
-
-
 class ConsentSharingCreate(BaseModel):
     shared_with_user_id: int
     record_ids: list[int]
@@ -440,6 +409,14 @@ class PatientEHRResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ConsultationPrescriptionCreate(BaseModel):
+    medicine_name: str
+    dosage: Optional[str] = None
+    frequency: Optional[str] = None
+    duration: Optional[str] = None
+    instructions: Optional[str] = None
+
+
 class ConsultationCreate(BaseModel):
     patient_id: int
     appointment_id: Optional[int] = None
@@ -447,6 +424,7 @@ class ConsultationCreate(BaseModel):
     diagnosis: Optional[str] = None
     doctor_notes: Optional[str] = None
     lab_requests: list[str] = []
+    prescriptions: list[ConsultationPrescriptionCreate] = []
 
 
 class ConsultationResponse(BaseModel):
@@ -458,19 +436,8 @@ class ConsultationResponse(BaseModel):
     doctor_notes: Optional[str] = None
     created_at: Optional[datetime] = None
     lab_requests_created: list[int] = []
+    prescriptions_created: list[int] = []
     model_config = ConfigDict(from_attributes=True)
-
-
-class DrugInteractionCheckRequest(BaseModel):
-    medicines: list[str]
-
-
-class DrugInteractionCheckResponse(BaseModel):
-    medicine1: str
-    medicine2: str
-    interaction_level: str
-    description: str
-    suggested_alternative: Optional[str] = None
 
 
 class ReportReviewUpdate(BaseModel):

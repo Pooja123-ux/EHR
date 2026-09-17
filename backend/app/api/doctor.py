@@ -1,31 +1,36 @@
 from datetime import date, datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from sqlalchemy import func
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
+import html
 
 from ..core.database import get_db
 from ..models.models import (
-    AISummary, AuditLog, Appointment, Doctor, LabReport, MedicalRecord,
+    AISummary, AuditLog, Appointment, ConsentSharing, Doctor, LabReport, MedicalRecord,
     MedicalTimeline, Notification, Patient, Prescription, User,
 )
-from ..ml.drug_interaction_predictor import predict_drug_interactions
 from ..schemas.schemas import (
     ConsultationCreate, ConsultationResponse,
     DoctorDashboardResponse, DoctorSummaryResponse,
-    DoctorUpdate, DrugInteractionCheckRequest,
-    DrugInteractionCheckResponse, MedicalRecordCreate,
+    DoctorUpdate, MedicalRecordCreate,
     MedicalRecordResponse, PatientEHRResponse,
     PrescriptionCreate, PrescriptionResponse, ReportReviewUpdate,
 )
-from .deps import get_current_user
+from .deps import get_current_user, require_role
 
-router = APIRouter(prefix="/api/doctor", tags=["doctor"])
+router = APIRouter(
+    prefix="/api/doctor",
+    tags=["doctor"],
+    dependencies=[Depends(require_role("Doctor"))],
+)
 
 
 class AppointmentStatusUpdate(BaseModel):
-    status: str
+    status: Literal["Pending", "Waiting", "Confirmed", "Accepted", "In Progress", "Completed", "Cancelled"]
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -35,6 +40,25 @@ def get_doctor_for_user(db: Session, user: User) -> Doctor:
     if not doctor:
         raise HTTPException(status_code=404, detail="Doctor profile not found")
     return doctor
+
+
+def _has_patient_relationship(db: Session, doctor_id: int, patient_id: int) -> bool:
+    return (
+        db.query(Appointment)
+        .filter(
+            Appointment.doctor_id == doctor_id,
+            Appointment.patient_id == patient_id,
+        )
+        .first()
+        is not None
+        or db.query(MedicalRecord)
+        .filter(
+            MedicalRecord.doctor_id == doctor_id,
+            MedicalRecord.patient_id == patient_id,
+        )
+        .first()
+        is not None
+    )
 
 
 def _build_ai_summary_for_patient(db: Session, patient_id: int) -> dict:
@@ -198,6 +222,7 @@ def get_patients(db: Session = Depends(get_db), current_user: User = Depends(get
         .join(Appointment, Appointment.patient_id == Patient.patient_id)
         .filter(Appointment.doctor_id == doctor.doctor_id)
         .filter(Appointment.appointment_date >= today)
+        .order_by(Patient.patient_id, Appointment.appointment_date.asc(), Appointment.appointment_time.asc())
         .distinct(Patient.patient_id)
         .all()
     )
@@ -221,6 +246,7 @@ def get_patients(db: Session = Depends(get_db), current_user: User = Depends(get
             "age": datetime.now().year - p.date_of_birth.year if p.date_of_birth else None,
             "appointment_time": str(appt.appointment_time)[:5] if appt.appointment_time else "",
             "appointment_date": appt.appointment_date,
+            "appointment_id": appt.appointment_id,
             "status": appt.status,
             "allergies": p.allergies,
             "chronic_diseases": p.chronic_diseases,
@@ -273,14 +299,9 @@ def get_patient_ehr(
     patient = db.query(Patient).filter(Patient.patient_id == patient_id).first()
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
+    if not _has_patient_relationship(db, doctor.doctor_id, patient.patient_id):
+        raise HTTPException(status_code=403, detail="No treatment relationship with this patient")
     user = db.query(User).filter(User.user_id == patient.user_id).first()
-
-    db.add(AuditLog(
-        user_id=current_user.user_id,
-        action=f"Doctor accessed EHR for patient_id={patient_id}",
-        module="doctor",
-    ))
-    db.commit()
 
     # Previous consultations (medical records)
     consultations = (
@@ -375,6 +396,13 @@ def get_patient_ehr(
     ]
 
     ai_summary = _build_ai_summary_for_patient(db, patient_id)
+
+    db.add(AuditLog(
+        user_id=current_user.user_id,
+        action=f"Doctor accessed EHR for patient_id={patient_id}",
+        module="doctor",
+    ))
+    db.commit()
 
     return PatientEHRResponse(
         patient_id=patient.patient_id,
@@ -498,7 +526,31 @@ def create_consultation(
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
 
-    # Create medical record
+    appointment = None
+    if data.appointment_id:
+        appointment = db.query(Appointment).filter(
+            Appointment.appointment_id == data.appointment_id,
+            Appointment.doctor_id == doctor.doctor_id,
+        ).first()
+        if not appointment:
+            raise HTTPException(status_code=404, detail="Appointment not found")
+        if appointment.patient_id != patient.patient_id:
+            raise HTTPException(status_code=400, detail="Appointment does not belong to this patient")
+    elif not _has_patient_relationship(db, doctor.doctor_id, patient.patient_id):
+        raise HTTPException(status_code=403, detail="No treatment relationship with this patient")
+
+    prescriptions_data = []
+    for prescription_data in data.prescriptions:
+        medicine_name = (prescription_data.medicine_name or "").strip()
+        if medicine_name:
+            prescriptions_data.append({
+                "medicine_name": medicine_name,
+                "dosage": (prescription_data.dosage or "").strip() or None,
+                "frequency": (prescription_data.frequency or "").strip() or None,
+                "duration": (prescription_data.duration or "").strip() or None,
+                "instructions": (prescription_data.instructions or "").strip() or None,
+            })
+
     record = MedicalRecord(
         patient_id=data.patient_id,
         doctor_id=doctor.doctor_id,
@@ -510,29 +562,57 @@ def create_consultation(
     db.add(record)
     db.flush()
 
-    # Update appointment if provided
-    if data.appointment_id:
-        appt = db.query(Appointment).filter(
-            Appointment.appointment_id == data.appointment_id
-        ).first()
-        if appt:
-            appt.status = "In Progress"
+    if appointment:
+        appointment.status = "In Progress"
 
-    # Create lab requests if needed
-    from ..models.models import Laboratory
     lab_request_ids = []
     for test_type in data.lab_requests:
+        normalized_test_type = (test_type or "").strip()
+        if not normalized_test_type:
+            continue
         lab_report = LabReport(
+            record_id=record.record_id,
             patient_id=data.patient_id,
             doctor_id=doctor.doctor_id,
-            report_type=test_type,
+            report_type=normalized_test_type,
             status="Requested",
         )
         db.add(lab_report)
         db.flush()
         lab_request_ids.append(lab_report.report_id)
 
-    # Add timeline event
+    prescription_ids = []
+    for prescription_data in prescriptions_data:
+        prescription = Prescription(
+            record_id=record.record_id,
+            medicine_name=prescription_data["medicine_name"],
+            dosage=prescription_data["dosage"],
+            frequency=prescription_data["frequency"],
+            duration=prescription_data["duration"],
+            instructions=prescription_data["instructions"],
+        )
+        db.add(prescription)
+        db.flush()
+        prescription_ids.append(prescription.prescription_id)
+        db.add(Notification(
+            user_id=patient.user_id,
+            title="New Prescription",
+            message=(
+                f"Dr. {current_user.full_name} has prescribed {prescription_data['medicine_name']}. "
+                f"{prescription_data['dosage'] or ''} {prescription_data['frequency'] or ''}."
+            ),
+        ))
+        db.add(MedicalTimeline(
+            patient_id=data.patient_id,
+            event_type="prescription",
+            event_name=f"Prescribed {prescription_data['medicine_name']}",
+            description=(
+                f"Dosage: {prescription_data['dosage']}, Frequency: {prescription_data['frequency']}, "
+                f"Duration: {prescription_data['duration']}"
+            ),
+            event_date=date.today(),
+        ))
+
     db.add(MedicalTimeline(
         patient_id=data.patient_id,
         event_type="record",
@@ -541,12 +621,13 @@ def create_consultation(
         event_date=date.today(),
     ))
 
-    # Notify patient
     db.add(Notification(
         user_id=patient.user_id,
         title="Consultation Recorded",
-        message=f"Dr. {current_user.full_name} has recorded your consultation." + (
-            f" {len(lab_request_ids)} lab test(s) requested." if lab_request_ids else ""
+        message=(
+            f"Dr. {current_user.full_name} has recorded your consultation."
+            f" {len(prescription_ids)} medicine(s) prescribed."
+            f" {len(lab_request_ids)} lab test(s) requested."
         ),
     ))
 
@@ -554,9 +635,12 @@ def create_consultation(
         db.add(Notification(
             user_id=patient.user_id,
             title="Lab Tests Requested",
-            message=f"Dr. {current_user.full_name} has requested {len(lab_request_ids)} lab test(s): {', '.join(data.lab_requests)}.",
+            message=(
+                f"Dr. {current_user.full_name} has requested {len(lab_request_ids)} lab test(s): "
+                f"{', '.join(test_type.strip() for test_type in data.lab_requests if test_type and test_type.strip())}."
+            ),
         ))
-        # Notify ALL lab users so any lab can see and pick up the request
+        from ..models.models import Laboratory
         lab_users = (
             db.query(User)
             .join(Laboratory, Laboratory.user_id == User.user_id)
@@ -569,9 +653,10 @@ def create_consultation(
                 user_id=lab_user.user_id,
                 title="New Lab Test Requested",
                 message=(
-                    f"Dr. {current_user.full_name} has requested {len(data.lab_requests)} test(s) "
+                    f"Dr. {current_user.full_name} has requested "
+                    f"{len([test_type for test_type in data.lab_requests if test_type and test_type.strip()])} test(s) "
                     f"for patient {patient_user.full_name if patient_user else 'Unknown'}: "
-                    f"{', '.join(data.lab_requests)}."
+                    f"{', '.join(test_type.strip() for test_type in data.lab_requests if test_type and test_type.strip())}."
                 ),
             ))
 
@@ -587,6 +672,166 @@ def create_consultation(
         doctor_notes=record.doctor_notes,
         created_at=record.created_at,
         lab_requests_created=lab_request_ids,
+        prescriptions_created=prescription_ids,
+    )
+
+
+@router.get("/consultations/{record_id}/report", response_class=HTMLResponse)
+def get_consultation_report(
+    record_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    doctor = get_doctor_for_user(db, current_user)
+    record = db.query(MedicalRecord).filter(
+        MedicalRecord.record_id == record_id,
+        MedicalRecord.doctor_id == doctor.doctor_id,
+    ).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Consultation not found")
+
+    patient = db.query(Patient).filter(Patient.patient_id == record.patient_id).first()
+    user = db.query(User).filter(User.user_id == patient.user_id).first() if patient else None
+    prescriptions = (
+        db.query(Prescription)
+        .filter(Prescription.record_id == record.record_id)
+        .order_by(Prescription.prescription_id.asc())
+        .all()
+    )
+    lab_requests = (
+        db.query(LabReport)
+        .filter(LabReport.record_id == record.record_id)
+        .order_by(LabReport.report_id.asc())
+        .all()
+    )
+    appointment = db.query(Appointment).filter(
+        Appointment.appointment_id == record.appointment_id,
+    ).first() if record.appointment_id else None
+
+    def value(text):
+        return html.escape(str(text).strip() if text is not None else "")
+
+    def display(text, fallback="—"):
+        escaped = value(text)
+        return escaped if escaped else html.escape(fallback)
+
+    prescription_rows = []
+    for prescription in prescriptions:
+        regimen = " + ".join(part for part in [
+            display(prescription.dosage, ""),
+            display(prescription.frequency, ""),
+            display(prescription.duration, ""),
+        ] if part)
+        prescription_rows.append(
+            "<tr>"
+            f"<td>{display(prescription.medicine_name)}</td>"
+            f"<td>{regimen or '—'}</td>"
+            f"<td>{display(prescription.instructions)}</td>"
+            "</tr>"
+        )
+
+    lab_rows = [
+        "<tr>"
+        f"<td>{display(lab_request.report_type)}</td>"
+        f"<td>{display(lab_request.status)}</td>"
+        "</tr>"
+        for lab_request in lab_requests
+    ]
+
+    appointment_details = ""
+    if appointment:
+        appointment_time = appointment.appointment_time.strftime("%I:%M %p") if appointment.appointment_time else ""
+        appointment_details = (
+            "<div class=\"detail-grid\">"
+            f"<div><span>Appointment date</span><strong>{display(appointment.appointment_date)}</strong></div>"
+            f"<div><span>Time</span><strong>{display(appointment_time)}</strong></div>"
+            f"<div><span>Reason</span><strong>{display(appointment.reason)}</strong></div>"
+            "</div>"
+        )
+
+    generated_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    report_html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Consultation Report {record.record_id}</title>
+<style>
+@page {{ size: A4; margin: 16mm; }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; color: #172033; font-family: Arial, sans-serif; font-size: 11pt; line-height: 1.45; }}
+.header {{ display: flex; justify-content: space-between; gap: 2rem; border-bottom: 3px solid #1375ff; padding-bottom: 14px; margin-bottom: 20px; }}
+.brand {{ font-size: 20pt; font-weight: 800; color: #1375ff; }}
+.subtitle {{ color: #5b7088; margin-top: 3px; }}
+.report-meta {{ text-align: right; color: #5b7088; font-size: 9pt; }}
+h1 {{ margin: 0 0 4px; font-size: 19pt; }}
+h2 {{ margin: 22px 0 9px; padding-bottom: 5px; border-bottom: 1px solid #d8e2ef; color: #1375ff; font-size: 12pt; text-transform: uppercase; letter-spacing: .04em; }}
+.detail-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 24px; }}
+.detail-grid div {{ display: flex; flex-direction: column; padding: 6px 0; border-bottom: 1px solid #eef2f7; }}
+.detail-grid span {{ color: #6b7c93; font-size: 8.5pt; }}
+.detail-grid strong {{ color: #172033; }}
+table {{ width: 100%; border-collapse: collapse; margin-top: 6px; }}
+th {{ background: #eaf3ff; color: #24547f; text-align: left; font-size: 9pt; text-transform: uppercase; letter-spacing: .03em; }}
+th, td {{ border: 1px solid #d8e2ef; padding: 8px 9px; vertical-align: top; }}
+td {{ background: #fff; }}
+.notes {{ white-space: pre-wrap; background: #f8fbff; border-left: 4px solid #1375ff; padding: 12px; }}
+.footer {{ margin-top: 30px; display: grid; grid-template-columns: 1fr 1fr; gap: 40px; }}
+.signature {{ border-top: 1px solid #172033; padding-top: 6px; color: #5b7088; }}
+.print-note {{ margin-top: 18px; color: #6b7c93; font-size: 8.5pt; }}
+@media print {{ .no-print {{ display: none; }} body {{ font-size: 10.5pt; }} }}
+</style>
+</head>
+<body>
+<div class="header">
+  <div><div class="brand">{display(doctor.hospital_name or 'Hospital')}</div><div class="subtitle">Consultation and Prescription Report</div></div>
+  <div class="report-meta">Report ID: {record.record_id}<br>Generated: {generated_at}</div>
+</div>
+<h1>Patient Consultation Report</h1>
+<div class="detail-grid">
+  <div><span>Patient name</span><strong>{display(user.full_name if user else "")}</strong></div>
+  <div><span>Patient ID</span><strong>{display(record.patient_id)}</strong></div>
+  <div><span>Date of birth</span><strong>{display(patient.date_of_birth.isoformat() if patient and patient.date_of_birth else "")}</strong></div>
+  <div><span>Gender</span><strong>{display(patient.gender if patient else "")}</strong></div>
+  <div><span>Blood group</span><strong>{display(patient.blood_group if patient else "")}</strong></div>
+  <div><span>Allergies</span><strong>{display(patient.allergies if patient else "")}</strong></div>
+  <div><span>Chronic diseases</span><strong>{display(patient.chronic_diseases if patient else "")}</strong></div>
+  <div><span>Emergency contact</span><strong>{display(patient.emergency_contact if patient else "")}</strong></div>
+</div>
+{appointment_details}
+<h2>Doctor</h2>
+<div class="detail-grid">
+  <div><span>Doctor</span><strong>Dr. {display(current_user.full_name)}</strong></div>
+  <div><span>Specialization</span><strong>{display(doctor.specialization)}</strong></div>
+  <div><span>Qualification</span><strong>{display(doctor.qualification)}</strong></div>
+  <div><span>License number</span><strong>{display(doctor.license_number)}</strong></div>
+  <div><span>Hospital</span><strong>{display(doctor.hospital_name)}</strong></div>
+  <div><span>Consultation date</span><strong>{display(record.created_at.strftime("%d %b %Y, %I:%M %p") if record.created_at else generated_at)}</strong></div>
+</div>
+<h2>Clinical Summary</h2>
+<div class="detail-grid">
+  <div><span>Diagnosis</span><strong>{display(record.diagnosis)}</strong></div>
+  <div><span>Symptoms</span><strong>{display(record.symptoms)}</strong></div>
+</div>
+<div class="notes"><strong>Clinical notes:</strong><br>{display(record.doctor_notes)}</div>
+<h2>Prescriptions</h2>
+<table>
+<thead><tr><th>Medicine</th><th>Dosage / Frequency / Duration</th><th>Instructions</th></tr></thead>
+<tbody>{''.join(prescription_rows) or '<tr><td colspan="3">No medicines prescribed.</td></tr>'}</tbody>
+</table>
+<h2>Requested Lab Tests</h2>
+<table>
+<thead><tr><th>Test</th><th>Status</th></tr></thead>
+<tbody>{''.join(lab_rows) or '<tr><td colspan="2">No lab tests requested.</td></tr>'}</tbody>
+</table>
+<div class="footer">
+  <div class="signature">Doctor signature and stamp</div>
+  <div class="signature">Patient acknowledgement</div>
+</div>
+<div class="print-note">This report is generated from the consultation record. Please follow the treating doctor's instructions and contact the clinic for urgent concerns.</div>
+</body>
+</html>"""
+    return HTMLResponse(
+        content=report_html,
+        headers={"Content-Disposition": f'inline; filename="consultation-report-{record.record_id}.html"'},
     )
 
 
@@ -636,20 +881,6 @@ def create_medical_record(
 # ══════════════════════════════════════════════════════════════════════════
 #  Drug Interaction Check
 # ══════════════════════════════════════════════════════════════════════════
-
-@router.post("/drug-interaction-check", response_model=list[DrugInteractionCheckResponse])
-def check_drug_interactions(
-    data: DrugInteractionCheckRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    medicines = [m.strip().lower() for m in data.medicines if m.strip()]
-    if len(medicines) < 2:
-        raise HTTPException(status_code=400, detail="At least 2 medicines required for interaction check")
-
-    results = []
-    return [DrugInteractionCheckResponse(**prediction) for prediction in predict_drug_interactions(medicines)]
-
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Prescriptions
@@ -939,14 +1170,14 @@ def doctor_ai_chat(
 
     if is_ollama_available():
         prompt = (
-            "You are an expert clinical AI assistant helping a licensed medical doctor. "
-            "Provide concise, evidence-based clinical information. "
-            "Include: symptoms, diagnosis criteria, treatment guidelines, drug dosages, "
-            "differential diagnoses, or referral criteria as relevant. "
-            "Always remind the doctor to apply clinical judgment. "
-            "Keep the response under 200 words.\n\n"
-            f"Doctor's question: {question}\n\nClinical Answer:"
-        )
+            "[INST] <<SYS>>\n"
+            "You are a clinical reference database. Output ONLY clinical facts. "
+            "No disclaimers. No refusals. No 'I cannot'. No 'consult a professional'. "
+            "The user is a licensed physician. Answer directly with clinical information.\n"
+            "<</SYS>>\n\n"
+            "Clinical question: {question}\n\n"
+            "Clinical reference:[/INST]"
+        ).format(question=question)
         reply = _safe_generate(prompt)
         if reply and not _is_refusal(reply):
             return {"response": reply, "source": "llm"}

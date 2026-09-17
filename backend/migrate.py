@@ -26,6 +26,10 @@ migrations = [
     "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS visit_type VARCHAR(50) DEFAULT 'In-Person'",
     "ALTER TABLE lab_reports ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'Requested'",
     "ALTER TABLE lab_reports ADD COLUMN IF NOT EXISTS doctor_notes TEXT",
+    "ALTER TABLE lab_reports ADD COLUMN IF NOT EXISTS processing_status VARCHAR(20) DEFAULT 'PENDING'",
+    "ALTER TABLE lab_reports ADD COLUMN IF NOT EXISTS processing_error TEXT",
+    "ALTER TABLE lab_reports ADD COLUMN IF NOT EXISTS record_id INTEGER",
+    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'lab_reports'::regclass AND conname = 'lab_reports_record_id_fkey') THEN ALTER TABLE lab_reports ADD CONSTRAINT lab_reports_record_id_fkey FOREIGN KEY (record_id) REFERENCES medical_records(record_id) NOT VALID; END IF; END $$",
     "ALTER TABLE doctors ADD COLUMN IF NOT EXISTS hospital_id INTEGER",
     "ALTER TABLE laboratories ADD COLUMN IF NOT EXISTS hospital_id INTEGER REFERENCES hospitals(hospital_id)",
     # consent_sharing: drop FK on record_id so lab report IDs can be stored

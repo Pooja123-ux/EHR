@@ -174,6 +174,44 @@ def predict_drug_interaction(drug1: str, drug2: str) -> dict[str, str | None]:
     return _format_prediction(drug1.title(), drug2.title(), level, description, alternative)
 
 
+def predict_drug_interaction_with_confidence(drug1: str, drug2: str) -> dict[str, Any]:
+    model = get_drug_interaction_model()
+    key = build_drug_pair_key(drug1, drug2)
+    dataset_map = model["dataset_map"]
+
+    if key in dataset_map:
+        record = dataset_map[key]
+        alternative = None
+        if record["level"] == "High Risk":
+            alternative = "Ask your healthcare provider before taking these medicines together."
+        elif record["level"] == "Moderate":
+            alternative = "Talk to a pharmacist or doctor before combining these medicines."
+        return {
+            "level": record["level"],
+            "description": record["description"],
+            "confidence": 1.0,
+            "source": "verified_dataset",
+            "alt": alternative,
+        }
+
+    text = f"{normalize_medicine_value(drug1)} || {normalize_medicine_value(drug2)}"
+    pipeline = model["pipeline"]
+    level = pipeline.predict([text])[0]
+    proba = pipeline.predict_proba([text])[0]
+    confidence = float(max(proba))
+
+    return {
+        "level": level,
+        "description": (
+            f"Estimated interaction risk based on trained dataset knowledge: {level}. "
+            "No exact match was found in the drug interactions database."
+        ),
+        "confidence": confidence,
+        "source": "ml_estimate",
+        "alt": None,
+    }
+
+
 def predict_drug_interactions(medicines: list[str]) -> list[dict[str, str | None]]:
     normalized = [m.strip() for m in medicines if m.strip()]
     seen: set[tuple[str, str]] = set()
@@ -189,5 +227,24 @@ def predict_drug_interactions(medicines: list[str]) -> list[dict[str, str | None
                 continue
             seen.add(key)
             results.append(predict_drug_interaction(first, second))
+
+    return results
+
+
+def predict_drug_interactions_with_confidence(medicines: list[str]) -> list[dict[str, Any]]:
+    normalized = [m.strip() for m in medicines if m.strip()]
+    seen: set[tuple[str, str]] = set()
+    results = []
+
+    for i in range(len(normalized)):
+        for j in range(i + 1, len(normalized)):
+            first, second = normalized[i], normalized[j]
+            if normalize_medicine_value(first) == normalize_medicine_value(second):
+                continue
+            key = build_drug_pair_key(first, second)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(predict_drug_interaction_with_confidence(first, second))
 
     return results

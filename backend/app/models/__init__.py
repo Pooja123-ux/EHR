@@ -8,8 +8,6 @@ from .models import (
     Prescription,
     LabReport,
     AISummary,
-    DiseasePrediction,
-    DrugInteraction,
     MedicalTimeline,
     Document,
     ConsentSharing,

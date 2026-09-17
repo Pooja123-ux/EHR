@@ -60,12 +60,12 @@ class Patient(Base):
     appointments = relationship("Appointment", back_populates="patient")
     medical_records = relationship("MedicalRecord", back_populates="patient")
     lab_reports = relationship("LabReport", back_populates="patient")
-    disease_predictions = relationship("DiseasePrediction", back_populates="patient")
-    drug_interactions = relationship("DrugInteraction", back_populates="patient")
     medical_timeline = relationship("MedicalTimeline", back_populates="patient")
     documents = relationship("Document", back_populates="patient")
     consent_sharings = relationship("ConsentSharing", back_populates="patient")
     ai_chats = relationship("AIChat", back_populates="patient")
+    disease_predictions = relationship("DiseasePrediction", back_populates="patient")
+    drug_interactions = relationship("DrugInteraction", back_populates="patient")
 
 
 class Doctor(Base):
@@ -158,6 +158,7 @@ class LabReport(Base):
     __tablename__ = "lab_reports"
 
     report_id = Column(Integer, primary_key=True, autoincrement=True)
+    record_id = Column(Integer, ForeignKey("medical_records.record_id"), nullable=True)
     patient_id = Column(Integer, ForeignKey("patients.patient_id"))
     doctor_id = Column(Integer, ForeignKey("doctors.doctor_id"))
     lab_id = Column(Integer, ForeignKey("laboratories.lab_id"))

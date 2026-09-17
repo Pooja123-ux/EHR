@@ -147,11 +147,33 @@ def create_tables() -> None:
         conn.execute(text("ALTER TABLE ai_summaries ADD COLUMN IF NOT EXISTS processing_version VARCHAR(20)"))
         conn.execute(text("ALTER TABLE lab_reports ADD COLUMN IF NOT EXISTS processing_status VARCHAR(20) DEFAULT 'PENDING'"))
         conn.execute(text("ALTER TABLE lab_reports ADD COLUMN IF NOT EXISTS processing_error TEXT"))
+        conn.execute(text("ALTER TABLE lab_reports ADD COLUMN IF NOT EXISTS record_id INTEGER"))
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'lab_reports'::regclass
+                      AND conname = 'lab_reports_record_id_fkey'
+                ) THEN
+                    ALTER TABLE lab_reports
+                    ADD CONSTRAINT lab_reports_record_id_fkey
+                    FOREIGN KEY (record_id) REFERENCES medical_records(record_id)
+                    NOT VALID;
+                END IF;
+            END
+            $$
+        """))
     try:
         from app.services.rag_service import init_medical_knowledge_base
         init_medical_knowledge_base()
     except Exception as e:
         print(f"[RAG] Startup initialization failed: {e}")
+    try:
+        from app.api.patient import _load_drug_list_from_csv
+        _load_drug_list_from_csv()
+    except Exception as e:
+        print(f"[DRUGS] Startup drug list initialization failed: {e}")
 
 
 @app.get("/health")

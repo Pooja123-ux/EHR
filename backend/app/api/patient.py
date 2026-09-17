@@ -12,29 +12,25 @@ from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
 from ..models.models import (
-    AISummary, AIChat, Appointment, AuditLog, ConsentSharing, DiseasePrediction,
-    Doctor, DoctorAvailability, DrugInteraction, LabReport, Laboratory, MedicalRecord, MedicalTimeline,
+    AISummary, AIChat, Appointment, AuditLog, ConsentSharing,
+    Doctor, DoctorAvailability, LabReport, Laboratory, MedicalRecord, MedicalTimeline,
     Notification, Patient, Prescription, User,
 )
 from ..schemas.schemas import (
     AIChatRequest, AIChatResponse,
     AppointmentCreate, AppointmentDetailResponse,
     ConsentSharingCreate, ConsentSharingResponse,
-    DiseasePredictionCreate, DiseasePredictionResponse,
-    DrugInteractionCreate, DrugInteractionResponse,
     MedicalRecordListItem, NotificationResponse,
     PatientDashboardResponse, PatientRecordCreate, PatientUpdate,
     PrescriptionResponse, TimelineEventResponse,
 )
-from ..services.llm_service import generate_chat_reply, extract_document_structure, generate_summary, _generate_summary_from_structure, is_ollama_available, _is_refusal, _client, LLM_MODEL, GENERATE_OPTIONS, _status_from_reference, _parse_reference_range
+from ..services.llm_service import generate_chat_reply, extract_document_structure, generate_summary, _generate_summary_from_structure, _is_refusal, _status_from_reference, _parse_reference_range
 from ..services.rag_service import rag_service, is_rag_available, init_medical_knowledge_base
 from ..services.vision_service import analyze_image as vision_analyze, analyze_image_with_type, is_vision_available
 from ..services.report_parsing import classify_report_type, build_summary_text as _build_summary_text
 from ..services.text_extraction import extract_text
 from ..services.background_processing import _process_report_background
 from ..services.report_validation import validate_extracted_data, _is_unit_consistent
-from ..ml.predictor import predict_disease
-from ..ml.drug_interaction_predictor import predict_drug_interaction
 from .deps import get_current_user
 from ..core.database import get_db
 
@@ -42,38 +38,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/patient", tags=["patient"])
 limiter = Limiter(key_func=get_remote_address)
-
-RECOMMENDATIONS = {
-    "LOW":    "Stay hydrated and rest well. Monitor symptoms for 48 hours. Take OTC medication if needed.",
-    "MEDIUM": "Schedule a doctor appointment soon. Avoid strenuous activity. Monitor temperature regularly.",
-    "HIGH":   "Seek immediate medical attention. Go to the nearest hospital. Do not self-medicate.",
-}
-
-DISEASE_DB = {
-    "Fever,Cough,Fatigue":            [{"name": "Influenza", "prob": 82}, {"name": "COVID-19", "prob": 15}, {"name": "Typhoid", "prob": 3}],
-    "Fever,Headache,Body Ache":       [{"name": "Dengue", "prob": 70}, {"name": "Malaria", "prob": 20}, {"name": "Typhoid", "prob": 10}],
-    "Chest Pain,Shortness of Breath": [{"name": "Angina", "prob": 55}, {"name": "Anxiety", "prob": 30}, {"name": "Pneumonia", "prob": 15}],
-    "default":                        [{"name": "Common Cold", "prob": 60}, {"name": "Viral Infection", "prob": 30}, {"name": "Allergies", "prob": 10}],
-}
-
-INTERACTION_DB = [
-    {"drugs": ["warfarin", "ibuprofen"],      "level": "High Risk",  "desc": "Ibuprofen increases the anticoagulant effect of Warfarin, significantly raising the risk of bleeding.", "alt": "Use Paracetamol instead of Ibuprofen"},
-    {"drugs": ["warfarin", "aspirin"],         "level": "High Risk",  "desc": "Aspirin combined with Warfarin greatly increases bleeding risk.", "alt": "Consult doctor before combining"},
-    {"drugs": ["metformin", "alcohol"],        "level": "Moderate",   "desc": "Alcohol can increase the risk of lactic acidosis when taken with Metformin.", "alt": "Avoid alcohol while on Metformin"},
-    {"drugs": ["simvastatin", "amiodarone"],   "level": "Moderate",   "desc": "Amiodarone can increase Simvastatin levels, raising the risk of muscle damage.", "alt": "Consider dose reduction or alternative statin"},
-    {"drugs": ["paracetamol", "amoxicillin"],  "level": "Safe",       "desc": "No significant interaction known between Paracetamol and Amoxicillin.", "alt": None},
-    {"drugs": ["omeprazole", "clopidogrel"],   "level": "Moderate",   "desc": "Omeprazole may reduce the effectiveness of Clopidogrel.", "alt": "Consider Pantoprazole as an alternative"},
-    {"drugs": ["ssri", "tramadol"],            "level": "High Risk",  "desc": "Combining SSRIs with Tramadol can cause serotonin syndrome.", "alt": "Use alternative pain management"},
-]
-
-COMMON_DRUGS = [
-    "Warfarin", "Ibuprofen", "Aspirin", "Metformin", "Alcohol",
-    "Simvastatin", "Amiodarone", "Paracetamol", "Amoxicillin",
-    "Omeprazole", "Clopidogrel", "SSRIs", "Tramadol",
-    "Atenolol", "Atorvastatin", "Cefalexin", "Cetirizine",
-    "Hydrochlorothiazide", "Insulin", "Levothyroxine", "Pantoprazole",
-]
-
 
 def get_patient_for_user(db: Session, user: User) -> Patient:
     patient = db.query(Patient).filter(Patient.user_id == user.user_id).first()
@@ -178,7 +142,7 @@ def get_records(db: Session = Depends(get_db), current_user: User = Depends(get_
             report_file=r.report_file,
             ai_summary=ai.summary if ai else None,
         )
-        for r, d, u, lab, ai in rows
+        for r, d, u, lab, ai in unique_rows
     ]
 
 
@@ -991,171 +955,7 @@ def ai_summary_chat(
 
 # ── Disease Prediction ────────────────────────────────────────────────────────
 
-@router.post("/disease-prediction", response_model=list[DiseasePredictionResponse], status_code=status.HTTP_201_CREATED)
-def create_disease_prediction(
-    data: DiseasePredictionCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    patient = get_patient_for_user(db, current_user)
-    symptoms = data.symptoms
-    symptoms_str = ", ".join(symptoms)
-
-    # Use ML model; fall back to static lookup if model unavailable
-    try:
-        diseases = predict_disease(symptoms, top_n=3)
-    except Exception as e:
-        logger.warning("[ML] Disease model unavailable, using static DB: %s", e)
-        key = next((k for k in DISEASE_DB if k != "default" and any(s in k for s in symptoms)), None)
-        diseases = DISEASE_DB[key or "default"]
-
-    max_prob = diseases[0]["prob"]
-    risk = "HIGH" if max_prob >= 70 else "MEDIUM" if max_prob >= 40 else "LOW"
-    recommendation = RECOMMENDATIONS[risk]
-
-    saved = []
-    for d in diseases:
-        pred = DiseasePrediction(
-            patient_id=patient.patient_id,
-            predicted_disease=d["name"],
-            probability=d["prob"],
-            risk_level=risk,
-            recommendation=recommendation,
-        )
-        db.add(pred)
-        db.flush()
-        saved.append(pred)
-    db.commit()
-
-    return [
-        DiseasePredictionResponse(
-            prediction_id=p.prediction_id,
-            predicted_disease=p.predicted_disease,
-            probability=p.probability,
-            risk_level=p.risk_level,
-            recommendation=p.recommendation,
-            prediction_date=p.prediction_date,
-            symptoms=symptoms_str,
-        )
-        for p in saved
-    ]
-
-
-@router.get("/disease-predictions", response_model=list[DiseasePredictionResponse])
-def get_disease_predictions(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    patient = get_patient_for_user(db, current_user)
-    return [
-        DiseasePredictionResponse(
-            prediction_id=p.prediction_id,
-            predicted_disease=p.predicted_disease,
-            probability=p.probability,
-            risk_level=p.risk_level,
-            recommendation=p.recommendation,
-            prediction_date=p.prediction_date,
-        )
-        for p in db.query(DiseasePrediction)
-        .filter(DiseasePrediction.patient_id == patient.patient_id)
-        .order_by(DiseasePrediction.prediction_date.desc())
-        .limit(20)
-        .all()
-    ]
-
-
 # ── Drug Interactions ─────────────────────────────────────────────────────────
-
-@router.get("/drug-list", response_model=list[str])
-def get_drug_list():
-    interaction_drugs = sorted({d for entry in INTERACTION_DB for d in entry.get("drugs", [])})
-    all_drugs = sorted(set(interaction_drugs) | set(COMMON_DRUGS))
-    return all_drugs
-
-
-@router.post("/drug-interaction", response_model=list[DrugInteractionResponse], status_code=status.HTTP_201_CREATED)
-def check_drug_interaction(
-    data: DrugInteractionCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    patient = get_patient_for_user(db, current_user)
-    filled = [m.strip() for m in data.medicines if m.strip()]
-    if len(filled) < 2:
-        raise HTTPException(status_code=400, detail="At least 2 medicines required")
-
-    saved = []
-    checked: set = set()
-    for i in range(len(filled)):
-        for j in range(i + 1, len(filled)):
-            pair = tuple(sorted([filled[i].lower(), filled[j].lower()]))
-            if pair in checked:
-                continue
-            checked.add(pair)
-            # Use ML model first; fall back to static INTERACTION_DB
-            try:
-                ml_result = predict_drug_interaction(filled[i], filled[j])
-                level = ml_result["interaction_level"]
-                description = ml_result["description"]
-                suggested_alternative = ml_result["suggested_alternative"]
-            except Exception as e:
-                logger.warning("[ML] Drug model unavailable, using static DB: %s", e)
-                match = next(
-                    (e for e in INTERACTION_DB if all(d in filled[i].lower() or d in filled[j].lower() for d in e["drugs"])),
-                    None,
-                )
-                description = match["desc"] if match else "No known significant interaction between these medicines."
-                suggested_alternative = match.get("alt") if match else None
-                level = match["level"] if match else "Safe"
-
-            if is_rag_available():
-                try:
-                    rag_query = f"drug interaction between {filled[i]} and {filled[j]}"
-                    rag_results = rag_service.search(rag_query, top_k=2, where={"type": "drug_db"})
-                    if rag_results:
-                        rag_context = "\n".join([chunk.text for chunk in rag_results])
-                        if is_ollama_available():
-                            prompt = (
-                                "You are a medical assistant. Explain the following drug interaction in simple terms for a patient.\n"
-                                "- Use the retrieved drug interaction information as the primary source of truth.\n"
-                                "- State the risk level clearly.\n"
-                                "- Explain what to do in plain language.\n"
-                                "- Do not diagnose. Always remind the patient to consult their doctor before changing medications.\n\n"
-                                f"Retrieved information:\n{rag_context}\n\n"
-                                f"Drug 1: {filled[i]}\nDrug 2: {filled[j]}\n\n"
-                                "Return a concise, patient-friendly explanation."
-                            )
-                            response = _client.generate(model=LLM_MODEL, prompt=prompt, options=GENERATE_OPTIONS)
-                            llm_text = response.get("response", "").strip()
-                            if llm_text:
-                                description = llm_text
-                except Exception as e:
-                    print(f"[RAG] Drug interaction retrieval failed: {e}")
-
-            interaction = DrugInteraction(
-                patient_id=patient.patient_id,
-                medicine1=filled[i],
-                medicine2=filled[j],
-                interaction_level=level,
-                description=description,
-                suggested_alternative=suggested_alternative,
-            )
-            db.add(interaction)
-            db.flush()
-            saved.append(interaction)
-    db.commit()
-
-    return [
-        DrugInteractionResponse(
-            interaction_id=x.interaction_id,
-            medicine1=x.medicine1,
-            medicine2=x.medicine2,
-            interaction_level=x.interaction_level,
-            description=x.description,
-            suggested_alternative=x.suggested_alternative,
-        )
-        for x in saved
-    ]
-
-
-# ── Timeline ──────────────────────────────────────────────────────────────────
 
 @router.get("/timeline", response_model=list[TimelineEventResponse])
 def get_timeline(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
