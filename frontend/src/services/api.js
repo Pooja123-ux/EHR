@@ -4,7 +4,8 @@ export function fileUrl(path) {
   if (!path) return null;
   if (path.startsWith('http')) return path;
   const clean = path.startsWith('/') ? path.slice(1) : path;
-  return `${BASE_URL}/${clean}`;
+  const token = getToken();
+  return `${BASE_URL}/${clean}${token ? `${clean.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}` : ''}`;
 }
 
 function getToken() {

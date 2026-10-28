@@ -1,8 +1,9 @@
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, Depends, HTTPException, Request, status
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -57,14 +58,23 @@ _bearer = HTTPBearer(auto_error=False)
 def serve_upload(
     file_path: str,
     credentials: HTTPAuthorizationCredentials = Depends(_bearer),
+    token: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    """Proxy for uploaded files — requires a valid JWT."""
-    if not credentials:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
-    # Validate token (reuse existing dep logic)
+    """Proxy for uploaded files — requires a valid JWT.
+
+    The JWT may be supplied as an Authorization header (fetch requests) or as a
+    `token` query parameter. Browsers do not attach headers to plain <a>/<img>
+    requests, so the frontend passes the stored access token in the URL.
+    """
     from app.core.security import decode_access_token
-    payload = decode_access_token(credentials.credentials)
+
+    raw = credentials.credentials if credentials else None
+    if not raw and token:
+        raw = token
+    if not raw:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    payload = decode_access_token(raw)
     if not payload or not payload.get("user_id"):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
